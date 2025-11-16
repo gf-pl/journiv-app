@@ -136,7 +136,7 @@ DOMAIN_NAME=your-server-ip-or-domain
 
 ## Documentation
 
-Read the [docs](https://github.com/journiv/journiv-app/wiki/Journiv-Documentation) to learn more about Journiv and configuring it.
+Read the [docs](https://github.com/journiv/journiv-app/wiki) to learn more about Journiv and configuring it.
 
 
 ## Contributing
