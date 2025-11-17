@@ -10,6 +10,7 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 from sqlalchemy import select, func
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.config import settings
 from app.core.logging_config import log_info, log_warning, log_error
@@ -232,12 +233,24 @@ class ImportService:
                     summary.media_files_deduplicated += result["media_deduplicated"]
                     summary.tags_created += result["tags_created"]
                     summary.tags_reused += result["tags_reused"]
-                except Exception as journal_error:
+                except (ValueError, SQLAlchemyError) as journal_error:
+                    # Narrow exception handling: catch expected DB/validation errors
+                    # but let unexpected errors propagate to outer handler
                     self.db.rollback()
                     warning_msg = (
                         f"Failed to import journal '{journal_dto.title}': {journal_error}"
                     )
                     log_error(journal_error, user_id=str(user_id), journal_title=journal_dto.title)
+                    summary.warnings.append(warning_msg)
+                    summary.entries_skipped += len(journal_dto.entries)
+                except Exception as journal_error:
+                    # Defensive catch-all for truly unexpected errors
+                    # This allows continuing with other journals even on programming errors
+                    self.db.rollback()
+                    warning_msg = (
+                        f"Failed to import journal '{journal_dto.title}': {journal_error}"
+                    )
+                    log_error(journal_error, user_id=str(user_id), journal_title=journal_dto.title, context="unexpected_journal_import_error")
                     summary.warnings.append(warning_msg)
                     summary.entries_skipped += len(journal_dto.entries)
 
@@ -418,7 +431,7 @@ class ImportService:
             content=entry_dto.content,
             entry_date=recalculated_entry_date,  # Recalculated local date
             entry_datetime_utc=entry_dto.entry_datetime_utc,  # UTC timestamp
-            entry_timezone=entry_dto.entry_timezone,  # IANA timezone
+            entry_timezone=entry_dto.entry_timezone or "UTC",  # IANA timezone, default to UTC
             word_count=word_count,  # Recalculate from content
             is_pinned=entry_dto.is_pinned,
             location=entry_dto.location,
@@ -595,11 +608,24 @@ class ImportService:
 
             if existing_media:
                 # Create media record pointing to existing file (deduplication)
-                media = self._create_media_record(
+                # Use canonical metadata from existing media record for consistency
+                media = EntryMedia(
                     entry_id=entry_id,
                     file_path=existing_media.file_path,
-                    media_dto=media_dto,
+                    original_filename=media_dto.filename,  # Keep DTO filename for this entry's context
+                    media_type=existing_media.media_type,  # Use canonical type
+                    file_size=existing_media.file_size,  # Use canonical size
+                    mime_type=existing_media.mime_type,  # Use canonical mime type
                     checksum=checksum,
+                    thumbnail_path=existing_media.thumbnail_path,  # Use canonical thumbnail
+                    width=existing_media.width,  # Use canonical dimensions
+                    height=existing_media.height,
+                    duration=existing_media.duration,
+                    alt_text=media_dto.alt_text or media_dto.caption,  # Use DTO alt text/caption
+                    upload_status=existing_media.upload_status,  # Use canonical status
+                    file_metadata=existing_media.file_metadata,  # Use canonical metadata
+                    created_at=media_dto.created_at,  # Preserve original timestamps from export
+                    updated_at=media_dto.updated_at,
                 )
                 self.db.add(media)
                 if record_mapping and media_dto.external_id:
@@ -717,28 +743,43 @@ class ImportService:
         """
         Import a tag with deduplication.
 
+        Uses existing_tag_names for fast-path check before querying DB.
+
         Returns:
             {"created": True/False}
         """
         tag_name_lower = tag_name.strip().lower()
 
-        # Find or create tag
-        tag = (
-            self.db.query(Tag)
-            .filter(
-                Tag.user_id == user_id,
-                Tag.name == tag_name_lower
+        # Fast-path: check if tag already exists in set
+        if tag_name_lower in existing_tag_names:
+            # Tag exists, just need to link it
+            tag = (
+                self.db.query(Tag)
+                .filter(
+                    Tag.user_id == user_id,
+                    Tag.name == tag_name_lower
+                )
+                .first()
             )
-            .first()
-        )
+            created = False
+        else:
+            # Tag doesn't exist in set, check DB and create if needed
+            tag = (
+                self.db.query(Tag)
+                .filter(
+                    Tag.user_id == user_id,
+                    Tag.name == tag_name_lower
+                )
+                .first()
+            )
 
-        created = False
-        if not tag:
-            tag = Tag(user_id=user_id, name=tag_name_lower)
-            self.db.add(tag)
-            self.db.flush()
-            existing_tag_names.add(tag_name_lower)
-            created = True
+            created = False
+            if not tag:
+                tag = Tag(user_id=user_id, name=tag_name_lower)
+                self.db.add(tag)
+                self.db.flush()
+                existing_tag_names.add(tag_name_lower)
+                created = True
 
         # Link tag to entry
         from app.models.entry_tag_link import EntryTagLink
@@ -766,7 +807,12 @@ class ImportService:
         return {t[0].lower() for t in tags}
 
     def _get_existing_mood_names(self, user_id: UUID) -> set:
-        """Get set of existing mood names (system-wide, lowercase)."""
+        """
+        Get set of existing mood names (system-wide, lowercase).
+
+        Note: Moods are system-wide, so user_id parameter is not used.
+        It's kept for API consistency with other _get_existing_* methods.
+        """
         moods = self.db.query(Mood.name).all()
         return {m[0].lower() for m in moods}
 
@@ -783,6 +829,10 @@ class ImportService:
     def cleanup_temp_files(self, file_path: Path):
         """
         Clean up temporary import files.
+
+        This is best-effort cleanup that should not fail the import process.
+        Broad exception handling is intentional to ensure cleanup attempts
+        don't raise errors even if file system operations fail.
 
         Args:
             file_path: Path to uploaded file
@@ -802,5 +852,6 @@ class ImportService:
                 shutil.rmtree(extract_dir)
 
             log_info(f"Cleaned up temp files for: {file_path}", file_path=str(file_path))
-        except Exception as e:
-            log_error(e, file_path=str(file_path))
+        except Exception as e:  # noqa: BLE001
+            # Best-effort cleanup: log but don't raise
+            log_error(e, file_path=str(file_path), context="cleanup_temp_files")

@@ -5,7 +5,7 @@ import uuid
 from pathlib import Path
 from typing import Annotated, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status, Query
 from fastapi.responses import FileResponse
 from sqlmodel import Session
 
@@ -228,7 +228,15 @@ async def download_export(
         if not job.file_path:
             raise HTTPException(status_code=404, detail="Export file path not found")
 
-        file_path = Path(job.file_path)
+        # Validate file path is within export directory (prevent directory traversal)
+        export_root = Path(settings.export_dir).resolve()
+        file_path = Path(job.file_path).resolve()
+
+        try:
+            file_path.relative_to(export_root)
+        except ValueError:
+            raise HTTPException(status_code=404, detail="Invalid export file path")
+
         if not file_path.exists():
             raise HTTPException(status_code=404, detail="Export file not found on disk")
 
@@ -268,8 +276,8 @@ async def list_exports(
     request: Request,
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[Session, Depends(get_session)],
-    limit: int = 20,
-    offset: int = 0,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
 ):
     """
     List export jobs for current user.
@@ -277,8 +285,6 @@ async def list_exports(
     Returns recent export jobs ordered by creation date (newest first).
     """
     try:
-        # Guard against very large result sets
-        limit = min(limit, 100)
 
         jobs = (
             session.query(ExportJob)
@@ -353,13 +359,26 @@ async def delete_export_job(
 
         # Delete export file if it exists
         if job.file_path:
-            file_path = Path(job.file_path)
-            if file_path.exists():
-                try:
-                    file_path.unlink()
-                except Exception as e:
-                    # Log but don't fail if file deletion fails
-                    log_error(e, request_id=None, user_email=current_user.email)
+            # Validate file path is within export directory (prevent directory traversal)
+            export_root = Path(settings.export_dir).resolve()
+            file_path = Path(job.file_path).resolve()
+
+            try:
+                file_path.relative_to(export_root)
+                if file_path.exists():
+                    try:
+                        file_path.unlink()
+                    except Exception as e:
+                        # Log but don't fail if file deletion fails
+                        log_error(e, request_id=None, user_email=current_user.email)
+            except ValueError:
+                # Invalid path - log warning but don't fail deletion
+                log_error(
+                    Exception("Invalid export file path detected during deletion"),
+                    request_id=None,
+                    user_email=current_user.email,
+                    context="export_file_deletion_path_validation"
+                )
 
         # Delete job record
         session.delete(job)

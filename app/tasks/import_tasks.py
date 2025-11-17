@@ -50,7 +50,7 @@ def process_import_job(self, job_id: str):
             # Create import service
             import_service = ImportService(db)
 
-            # Update progress: Extracting data
+            # Update progress: Extracting (set minimum)
             job.set_progress(ProgressStages.IMPORT_EXTRACTING)
             db.commit()
 
@@ -64,20 +64,22 @@ def process_import_job(self, job_id: str):
             total_entries = import_service.count_entries_in_data(data)
             job.total_items = total_entries
             job.processed_items = 0
+
+            # Update progress: Processing (ensure minimum, but don't regress from extracting)
+            current_progress = job.progress or ProgressStages.IMPORT_PROCESSING
+            job.set_progress(max(current_progress, ProgressStages.IMPORT_PROCESSING))
             db.commit()
 
-            # Create throttled progress callback
+            # Create throttled progress callback for processing stage
+            # Progress range: 30% (PROCESSING) to 90% (FINALIZING)
             handle_progress = create_throttled_progress_callback(
                 job=job,
                 db=db,
-                max_progress=90,
+                start_progress=ProgressStages.IMPORT_PROCESSING,
+                end_progress=ProgressStages.IMPORT_FINALIZING,
                 commit_interval=10,
                 percentage_threshold=5,
             )
-
-            # Update progress: Importing data
-            job.set_progress(ProgressStages.IMPORT_PROCESSING)
-            db.commit()
 
             # Import based on source type
             if job.source_type == ImportSourceType.JOURNIV:
@@ -93,8 +95,9 @@ def process_import_job(self, job_id: str):
                     f"Import from {job.source_type} not yet implemented"
                 )
 
-            # Update progress: Finalizing
-            job.set_progress(ProgressStages.IMPORT_FINALIZING)
+            # Update progress: Finalizing (ensure minimum, but don't regress)
+            current_progress = job.progress or ProgressStages.IMPORT_FINALIZING
+            job.set_progress(max(current_progress, ProgressStages.IMPORT_FINALIZING))
             db.commit()
 
             # Build result data

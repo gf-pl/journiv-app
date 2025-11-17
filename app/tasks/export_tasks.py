@@ -55,18 +55,20 @@ def process_export_job(job_id: str):
             job.processed_items = 0
             db.commit()
 
-            # Create throttled progress callback
+            # Update progress: Building export data (set minimum)
+            job.set_progress(ProgressStages.EXPORT_BUILDING_DATA)
+            db.commit()
+
+            # Create throttled progress callback for data building stage
+            # Progress range: 10% (BUILDING_DATA) to 50% (CREATING_ZIP)
             handle_progress = create_throttled_progress_callback(
                 job=job,
                 db=db,
-                max_progress=80,
+                start_progress=ProgressStages.EXPORT_BUILDING_DATA,
+                end_progress=ProgressStages.EXPORT_CREATING_ZIP,
                 commit_interval=10,
                 percentage_threshold=5,
             )
-
-            # Update progress: Building export data
-            job.set_progress(ProgressStages.EXPORT_BUILDING_DATA)
-            db.commit()
 
             # Build export data
             export_data = export_service.build_export_data(
@@ -77,8 +79,9 @@ def process_export_job(job_id: str):
                 progress_callback=handle_progress,
             )
 
-            # Update progress: Creating ZIP
-            job.set_progress(ProgressStages.EXPORT_CREATING_ZIP)
+            # Update progress: Creating ZIP (ensure minimum, but don't regress)
+            current_progress = job.progress or ProgressStages.EXPORT_CREATING_ZIP
+            job.set_progress(max(current_progress, ProgressStages.EXPORT_CREATING_ZIP))
             db.commit()
 
             # Create ZIP archive
@@ -88,8 +91,9 @@ def process_export_job(job_id: str):
                 include_media=job.include_media,
             )
 
-            # Update progress: Finalizing
-            job.set_progress(ProgressStages.EXPORT_FINALIZING)
+            # Update progress: Finalizing (ensure minimum, but don't regress)
+            current_progress = job.progress or ProgressStages.EXPORT_FINALIZING
+            job.set_progress(max(current_progress, ProgressStages.EXPORT_FINALIZING))
             db.commit()
 
             # Mark as completed

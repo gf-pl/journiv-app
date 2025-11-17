@@ -120,6 +120,14 @@ class EntryDTO(BaseModel):
     # Import tracking (not exported for regular users)
     external_id: Optional[str] = Field(None, description="Original ID from source system")
 
+    @field_validator('entry_timezone', mode='before')
+    @classmethod
+    def normalize_timezone(cls, v):
+        """Normalize timezone to ensure it's never None or empty."""
+        if not v or v == "":
+            return "UTC"
+        return v
+
     @field_validator('tags', mode='before')
     @classmethod
     def normalize_tags(cls, v):

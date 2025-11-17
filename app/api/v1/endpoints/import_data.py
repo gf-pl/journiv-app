@@ -6,7 +6,7 @@ import shutil
 from typing import Annotated, List
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Query
 from sqlmodel import Session
 
 from app.api.dependencies import get_current_user
@@ -90,25 +90,29 @@ async def upload_import(
 
     try:
         # Save uploaded file
-        with open(upload_path, "wb") as buffer:
-            # Read in chunks to handle large files
-            chunk_size = 8192
-            total_size = 0
-            max_size_mb = settings.import_export_max_file_size_mb
+        chunk_size = 8192
+        total_size = 0
+        max_size_mb = settings.import_export_max_file_size_mb
+        too_large = False
 
+        with open(upload_path, "wb") as buffer:
             while chunk := await file.read(chunk_size):
                 total_size += len(chunk)
 
                 # Check file size limit using shared utility
                 if not MediaHandler.validate_file_size(total_size, max_size_mb):
-                    # Clean up partial file
-                    upload_path.unlink(missing_ok=True)
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"File too large. Maximum size: {max_size_mb}MB"
-                    )
+                    too_large = True
+                    break
 
                 buffer.write(chunk)
+
+        if too_large:
+            # Clean up partial file after closing the file handle (Windows compatibility)
+            upload_path.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large. Maximum size: {max_size_mb}MB"
+            )
 
         # Validate ZIP structure
         from app.utils.import_export import ZipHandler
@@ -159,14 +163,22 @@ async def upload_import(
         # Clean up on HTTP errors
         upload_path.unlink(missing_ok=True)
         raise
-    except Exception as e:
-        # Clean up on unexpected errors
+    except (ValueError, OSError, IOError) as e:
+        # Narrow exception handling for file/validation errors
         upload_path.unlink(missing_ok=True)
-        log_error(e, request_id=None, user_email=current_user.email)
+        log_error(e, request_id=None, user_email=current_user.email, context="import_file_processing")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid import file: {str(e)}"
+        ) from e
+    except Exception as e:
+        # Defensive catch-all for unexpected errors
+        upload_path.unlink(missing_ok=True)
+        log_error(e, request_id=None, user_email=current_user.email, context="import_file_processing_unexpected")
         raise HTTPException(
             status_code=500,
             detail="An error occurred while processing import file"
-        )
+        ) from e
 
 
 @router.get(
@@ -180,7 +192,7 @@ async def upload_import(
         500: {"description": "Internal server error"},
     }
 )
-async def get_import_status(
+def get_import_status(
     job_id: uuid.UUID,
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[Session, Depends(get_session)]
@@ -218,8 +230,11 @@ async def get_import_status(
     except HTTPException:
         raise
     except Exception as e:
-        log_error(e, request_id=None, user_email=current_user.email)
-        raise HTTPException(status_code=500, detail="An error occurred while retrieving import status")
+        log_error(e, request_id=None, user_email=current_user.email, context="get_import_status")
+        raise HTTPException(
+            status_code=500,
+            detail="An error occurred while retrieving import status"
+        ) from e
 
 
 @router.get(
@@ -231,11 +246,11 @@ async def get_import_status(
         500: {"description": "Internal server error"},
     }
 )
-async def list_imports(
+def list_imports(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[Session, Depends(get_session)],
-    limit: int = 20,
-    offset: int = 0,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
 ):
     """
     List import jobs for current user.
@@ -243,8 +258,6 @@ async def list_imports(
     Returns recent import jobs ordered by creation date (newest first).
     """
     try:
-        # Guard against very large result sets
-        limit = min(limit, 100)
 
         jobs = (
             session.query(ImportJob)
@@ -273,8 +286,11 @@ async def list_imports(
         ]
 
     except Exception as e:
-        log_error(e, request_id=None, user_email=current_user.email)
-        raise HTTPException(status_code=500, detail="An error occurred while listing imports")
+        log_error(e, request_id=None, user_email=current_user.email, context="list_imports")
+        raise HTTPException(
+            status_code=500,
+            detail="An error occurred while listing imports"
+        ) from e
 
 
 @router.delete(
@@ -289,7 +305,7 @@ async def list_imports(
         500: {"description": "Internal server error"},
     }
 )
-async def delete_import_job(
+def delete_import_job(
     job_id: uuid.UUID,
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[Session, Depends(get_session)]
@@ -340,5 +356,8 @@ async def delete_import_job(
     except HTTPException:
         raise
     except Exception as e:
-        log_error(e, request_id=None, user_email=current_user.email)
-        raise HTTPException(status_code=500, detail="An error occurred while deleting import job")
+        log_error(e, request_id=None, user_email=current_user.email, context="delete_import_job")
+        raise HTTPException(
+            status_code=500,
+            detail="An error occurred while deleting import job"
+        ) from e
