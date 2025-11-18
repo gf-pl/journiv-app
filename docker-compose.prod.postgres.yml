@@ -7,7 +7,7 @@
 #   SECRET_KEY      - Generate with: python -c "import secrets; print(secrets.token_urlsafe(32))"
 #   DOMAIN_NAME     - Needed when running in same-origin SPA mode (ENABLE_CORS=false).
 #   POSTGRES_PASSWORD (if not relying on defaults, strongly recommended to change in production).
-
+#   APP_VERSION - Example: APP_VERSION=0.1.0-beta.7
 services:
   postgres:
     image: postgres:15
@@ -57,7 +57,7 @@ services:
       start_period: 10s
 
   celery-worker:
-    image: swalabtech/journiv-app:latest
+    image: swalabtech/journiv-app:${APP_VERSION:-0.1.0-beta.7}
     container_name: journiv-celery-worker
     command: celery -A app.core.celery_app worker --loglevel=info
     environment:
@@ -109,7 +109,7 @@ services:
         max-file: "5"
 
   app:
-    image: swalabtech/journiv-app:latest
+    image: swalabtech/journiv-app:${APP_VERSION:-0.1.0-beta.7}
     container_name: journiv-postgres-app
     ports:
       - "${APP_PORT:-8000}:8000" # Right side must remain 8000

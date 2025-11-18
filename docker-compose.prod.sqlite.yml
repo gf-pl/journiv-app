@@ -7,10 +7,10 @@
 # Required Environment Variables:
 #   SECRET_KEY  - Generate with: python -c "import secrets; print(secrets.token_urlsafe(32))"
 #   DOMAIN_NAME - Needed when running in same-origin SPA mode (ENABLE_CORS=false)
+#   APP_VERSION - Example: APP_VERSION=0.1.0-beta.7
 
 services:
   redis:
-    # Redis (Do not remove. Journiv runs with multiple workers which need to share state.)
     image: redis:7
     container_name: journiv-redis-cache
     restart: unless-stopped
@@ -26,14 +26,14 @@ services:
       start_period: 10s
 
   celery-worker:
-    image: swalabtech/journiv-app:latest
+    image: swalabtech/journiv-app:${APP_VERSION:-0.1.0-beta.7}
     container_name: journiv-celery-worker
     command: celery -A app.core.celery_app worker --loglevel=info
     environment:
       # Database
       - DATABASE_URL=${DATABASE_URL:-sqlite:////data/journiv.db}
 
-      # Redis
+      # Redis Do not remove. Journiv runs with multiple workers which need to share state.
       - REDIS_URL=redis://redis:6379/0
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
@@ -72,10 +72,11 @@ services:
         max-file: "5"
 
   app:
-    image: swalabtech/journiv-app:latest
+    image: swalabtech/journiv-app:${APP_VERSION:-0.1.0-beta.7}
     container_name: journiv-sqlite-app
     ports:
-      - "${APP_PORT:-8000}:8000" # Right side must always remain 8000
+      - "${APP_PORT:-8000}:8000" # Right side must remain 8000
+
     environment:
       # Database
       - DATABASE_URL=${DATABASE_URL:-sqlite:////data/journiv.db}
@@ -148,12 +149,14 @@ services:
       - backend
       - frontend
     restart: unless-stopped
+
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/api/v1/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
+
     cpus: "2.0"
     mem_limit: 2g
     mem_reservation: 512m

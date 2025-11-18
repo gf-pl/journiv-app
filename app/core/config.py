@@ -148,21 +148,19 @@ class Settings(BaseSettings):
     @property
     def effective_database_url(self) -> str:
         """Get the effective database URL based on configuration hierarchy."""
-        # Priority 1: If DATABASE_URL explicitly specifies SQLite, use it (prevents override)
-        if self.database_url.startswith("sqlite"):
-            return self.database_url
-
-        # Priority 2: Explicit PostgreSQL URL
+        # Priority 1: Explicit PostgreSQL URL
         if self.postgres_url:
             return self.postgres_url
 
-        # Priority 3: PostgreSQL components (Docker environment)
+        # Priority 2: PostgreSQL components (Docker environment)
+        # Check PostgreSQL components BEFORE falling back to DATABASE_URL default
         if self.postgres_host and self.postgres_user and self.postgres_db:
             password = self.postgres_password or ""
             port = self.postgres_port or 5432
             return f"postgresql://{self.postgres_user}:{password}@{self.postgres_host}:{port}/{self.postgres_db}"
 
-        # Priority 4: Primary database URL (defaults to SQLite)
+        # Priority 3: Explicit DATABASE_URL (could be SQLite or PostgreSQL)
+        # Only use this if PostgreSQL components are not set
         return self.database_url
 
     @field_validator('secret_key')
