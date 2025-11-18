@@ -17,9 +17,6 @@ jobs:
     name: Docker Compose Health Check
     runs-on: ubuntu-latest
 
-    env:
-      APP_VERSION: 0.1.0-beta.7
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -29,8 +26,8 @@ jobs:
 
       - name: Build Journiv Docker image
         run: |
-          echo "🔨 Building Journiv Docker image with version $APP_VERSION..."
-          docker build -t swalabtech/journiv-app:$APP_VERSION .
+          echo "🔨 Building Journiv Docker image..."
+          docker build -t swalabtech/journiv-app:latest .
 
       - name: Create test environment file
         run: |
@@ -42,22 +39,21 @@ jobs:
           DOMAIN_NAME=localhost
           DOMAIN_SCHEME=http
           APP_PORT=8000
-          APP_VERSION=$APP_VERSION
           ENVIRONMENT=production
           DEBUG=false
           ENABLE_CORS=false
           DISABLE_SIGNUP=false
           EOF
 
-          echo "✅ Environment file created (APP_VERSION=$APP_VERSION)"
+          echo "✅ Environment file created"
 
       - name: Start Journiv with Docker Compose
         run: |
-          echo "🚀 Starting Journiv services..."
-          docker compose -f docker-compose.prod.sqlite.yml --env-file .env.test up -d
+          echo "🚀 Starting Journiv services with APP_VERSION=latest..."
+          APP_VERSION=latest docker compose -f docker-compose.prod.sqlite.yml --env-file .env.test up -d
 
           echo "📋 Checking running containers..."
-          docker compose -f docker-compose.prod.sqlite.yml ps
+          APP_VERSION=latest docker compose -f docker-compose.prod.sqlite.yml ps
 
       - name: Wait for Journiv to be healthy
         run: |
@@ -80,7 +76,7 @@ jobs:
             # Show container status for debugging
             if [ $((ATTEMPT % 5)) -eq 0 ]; then
               echo "  📊 Container status:"
-              docker compose -f docker-compose.prod.sqlite.yml ps
+              APP_VERSION=latest docker compose -f docker-compose.prod.sqlite.yml ps
             fi
 
             sleep $SLEEP_TIME
@@ -88,9 +84,9 @@ jobs:
 
           echo "❌ Journiv failed to become healthy after $MAX_ATTEMPTS attempts"
           echo "📋 Final container status:"
-          docker compose -f docker-compose.prod.sqlite.yml ps
+          APP_VERSION=latest docker compose -f docker-compose.prod.sqlite.yml ps
           echo "📋 Application logs:"
-          docker compose -f docker-compose.prod.sqlite.yml logs app
+          APP_VERSION=latest docker compose -f docker-compose.prod.sqlite.yml logs app
           exit 1
 
       - name: Test health endpoint
@@ -115,23 +111,23 @@ jobs:
         if: success()
         run: |
           echo "📋 Application logs (last 50 lines):"
-          docker compose -f docker-compose.prod.sqlite.yml logs --tail=50 app
+          APP_VERSION=latest docker compose -f docker-compose.prod.sqlite.yml logs --tail=50 app
 
       - name: Show application logs (on failure)
         if: failure()
         run: |
           echo "📋 Full application logs:"
-          docker compose -f docker-compose.prod.sqlite.yml logs app
+          APP_VERSION=latest docker compose -f docker-compose.prod.sqlite.yml logs app
           echo ""
           echo "📋 Redis logs:"
-          docker compose -f docker-compose.prod.sqlite.yml logs redis
+          APP_VERSION=latest docker compose -f docker-compose.prod.sqlite.yml logs redis
           echo ""
           echo "📋 Celery worker logs:"
-          docker compose -f docker-compose.prod.sqlite.yml logs celery-worker
+          APP_VERSION=latest docker compose -f docker-compose.prod.sqlite.yml logs celery-worker
 
       - name: Cleanup
         if: always()
         run: |
           echo "🧹 Cleaning up..."
-          docker compose -f docker-compose.prod.sqlite.yml down -v
+          APP_VERSION=latest docker compose -f docker-compose.prod.sqlite.yml down -v
           echo "✅ Cleanup complete"
