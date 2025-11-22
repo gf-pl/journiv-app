@@ -11,7 +11,7 @@ from sqlmodel import Session
 
 from app.api.dependencies import get_current_user
 from app.core.database import get_session
-from app.core.exceptions import EntryNotFoundError, JournalNotFoundError
+from app.core.exceptions import EntryNotFoundError, JournalNotFoundError, ValidationError
 from app.core.logging_config import log_user_action, log_error
 from app.models.user import User
 from app.schemas.entry import EntryCreate, EntryUpdate, EntryResponse, EntryMediaCreate, EntryMediaResponse
@@ -238,6 +238,7 @@ async def get_entry(
         401: {"description": "Not authenticated"},
         403: {"description": "Account inactive"},
         404: {"description": "Entry not found"},
+        422: {"description": "Validation error (e.g., cannot move to archived journal)"},
         500: {"description": "Internal server error"},
     }
 )
@@ -255,6 +256,10 @@ async def update_entry(
         return entry
     except EntryNotFoundError:
         raise HTTPException(status_code=404, detail="Entry not found")
+    except JournalNotFoundError:
+        raise HTTPException(status_code=404, detail="Target journal not found") from None
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from None
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

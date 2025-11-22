@@ -43,6 +43,7 @@ class EntryUpdate(BaseModel):
     location: Optional[str] = None
     weather: Optional[str] = None
     is_pinned: Optional[bool] = None
+    journal_id: Optional[uuid.UUID] = None
 
 
 class EntryResponse(EntryBase, TimestampMixin):

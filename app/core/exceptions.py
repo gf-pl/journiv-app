@@ -90,3 +90,8 @@ class TokenNotFoundError(JournivAppException):
 class TokenAlreadyRevokedError(JournivAppException):
     """Raised when a token is already revoked."""
     pass
+
+
+class ValidationError(JournivAppException):
+    """Raised when validation fails."""
+    pass

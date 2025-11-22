@@ -90,16 +90,16 @@ def test_update_entry_adjusts_metadata(
     assert updated["word_count"] == 5
 
 
-def test_update_entry_cannot_change_journal(
+def test_update_entry_can_change_journal(
     api_client: JournivApiClient,
     api_user: ApiUser,
     journal_factory,
     entry_factory,
 ):
-    """Updating an entry with a new journal_id should keep it with the original journal."""
+    """Updating an entry with a new journal_id should move it to the target journal."""
     source_journal = journal_factory(title="Source Journal")
     target_journal = journal_factory(title="Target Journal")
-    entry = entry_factory(journal=source_journal)
+    entry = entry_factory(journal=source_journal, content="Test entry with five words here")
 
     response = api_client.request(
         "PUT",
@@ -109,7 +109,125 @@ def test_update_entry_cannot_change_journal(
     )
     assert response.status_code == 200
     payload = response.json()
-    assert payload["journal_id"] == source_journal["id"]
+    assert payload["journal_id"] == target_journal["id"]
+
+    # Verify the entry was moved by fetching it again
+    fetched = api_client.get_entry(api_user.access_token, entry["id"])
+    assert fetched["journal_id"] == target_journal["id"]
+
+
+def test_journal_stats_update_when_entry_moves_between_journals(
+    api_client: JournivApiClient,
+    api_user: ApiUser,
+    journal_factory,
+    entry_factory,
+):
+    """When an entry is moved between journals, both journal stats should update correctly."""
+    source_journal = journal_factory(title="Source Journal")
+    target_journal = journal_factory(title="Target Journal")
+
+    # Create entries in source journal with known word counts
+    entry1 = entry_factory(
+        journal=source_journal,
+        title="Entry One",
+        content="This entry has exactly five words"  # 6 words
+    )
+    entry2 = entry_factory(
+        journal=source_journal,
+        title="Entry Two",
+        content="Another test entry with more words here"  # 7 words
+    )
+
+    # Create one entry in target journal
+    entry3 = entry_factory(
+        journal=target_journal,
+        title="Target Entry",
+        content="Initial target journal entry"  # 4 words
+    )
+
+    # Get initial journal stats
+    source_journal_initial = api_client.request(
+        "GET",
+        f"/journals/{source_journal['id']}",
+        token=api_user.access_token,
+    ).json()
+
+    target_journal_initial = api_client.request(
+        "GET",
+        f"/journals/{target_journal['id']}",
+        token=api_user.access_token,
+    ).json()
+
+    # Verify initial state
+    assert source_journal_initial["entry_count"] == 2
+    assert target_journal_initial["entry_count"] == 1
+
+    # Get the word count of the entry we're about to move
+    entry_to_move = api_client.get_entry(api_user.access_token, entry1["id"])
+    moved_entry_word_count = entry_to_move["word_count"]
+
+    # Move entry1 from source to target journal
+    api_client.update_entry(
+        api_user.access_token,
+        entry1["id"],
+        {"journal_id": target_journal["id"]},
+    )
+
+    # Get updated journal stats
+    source_journal_after = api_client.request(
+        "GET",
+        f"/journals/{source_journal['id']}",
+        token=api_user.access_token,
+    ).json()
+
+    target_journal_after = api_client.request(
+        "GET",
+        f"/journals/{target_journal['id']}",
+        token=api_user.access_token,
+    ).json()
+
+    # Verify source journal stats decreased
+    assert source_journal_after["entry_count"] == source_journal_initial["entry_count"] - 1
+    assert source_journal_after["entry_count"] == 1
+    assert source_journal_after["total_words"] == source_journal_initial["total_words"] - moved_entry_word_count
+
+    # Verify target journal stats increased
+    assert target_journal_after["entry_count"] == target_journal_initial["entry_count"] + 1
+    assert target_journal_after["entry_count"] == 2
+    assert target_journal_after["total_words"] == target_journal_initial["total_words"] + moved_entry_word_count
+
+    # Verify the moved entry still has the same word count
+    entry_after_move = api_client.get_entry(api_user.access_token, entry1["id"])
+    assert entry_after_move["word_count"] == moved_entry_word_count
+
+
+def test_cannot_move_entry_to_archived_journal(
+    api_client: JournivApiClient,
+    api_user: ApiUser,
+    journal_factory,
+    entry_factory,
+):
+    """Moving an entry to an archived journal should fail with appropriate error."""
+    source_journal = journal_factory(title="Source Journal")
+    target_journal = journal_factory(title="Target Journal")
+    entry = entry_factory(journal=source_journal)
+
+    # Archive the target journal
+    api_client.archive_journal(api_user.access_token, target_journal["id"])
+
+    response = api_client.request(
+        "PUT",
+        f"/entries/{entry['id']}",
+        token=api_user.access_token,
+        json={"journal_id": target_journal["id"]},
+    )
+
+    assert response.status_code == 422
+
+    # Verify entry stayed in source journal
+    fetched = api_client.get_entry(api_user.access_token, entry["id"])
+    assert fetched["journal_id"] == source_journal["id"]
+
 
 def test_entry_search_and_date_range_filters(
     api_client: JournivApiClient,

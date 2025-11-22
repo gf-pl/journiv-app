@@ -9,7 +9,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlmodel import Session, select
 from zoneinfo import ZoneInfo
 
-from app.core.exceptions import EntryNotFoundError, JournalNotFoundError
+from app.core.exceptions import EntryNotFoundError, JournalNotFoundError, ValidationError
 from app.core.logging_config import log_info, log_warning, log_error
 from app.core.time_utils import utc_now, local_date_for_user, ensure_utc, to_utc
 from app.models.entry import Entry, EntryMedia
@@ -216,6 +216,31 @@ class EntryService:
         """Update an entry."""
         entry = self._get_owned_entry(entry_id, user_id)
 
+        # Handle journal change if requested
+        old_journal_id = None
+        new_journal_id = None
+        if entry_data.journal_id is not None and entry_data.journal_id != entry.journal_id:
+            # Validate new journal exists and belongs to user
+            new_journal_statement = select(Journal).where(
+                Journal.id == entry_data.journal_id,
+                Journal.user_id == user_id
+            )
+            new_journal = self.session.exec(new_journal_statement).first()
+            if not new_journal:
+                log_warning(f"Target journal not found for user {user_id}: {entry_data.journal_id}")
+                raise JournalNotFoundError("Target journal not found")
+
+            # Prevent moving into archived journals
+            if new_journal.is_archived:
+                log_warning(f"Cannot move entry {entry_id} to archived journal {new_journal.id}")
+                raise ValidationError("Cannot move entry to an archived journal")
+
+            # Store old and new journal IDs for stats recalculation
+            old_journal_id = entry.journal_id
+            new_journal_id = entry_data.journal_id
+            entry.journal_id = new_journal_id
+            log_info(f"Entry {entry_id} journal changed from {old_journal_id} to {new_journal_id}")
+
         # Update fields
         if entry_data.title is not None:
             entry.title = entry_data.title
@@ -258,6 +283,22 @@ class EntryService:
             self.session.rollback()
             log_error(exc)
             raise
+
+        # Recalculate stats for both journals if journal was changed
+        if old_journal_id is not None and new_journal_id is not None:
+            try:
+                from app.services.journal_service import JournalService
+                journal_service = JournalService(self.session)
+                # Recalculate old journal stats
+                journal_service.recalculate_journal_entry_count(old_journal_id, user_id)
+                # Recalculate new journal stats
+                journal_service.recalculate_journal_entry_count(new_journal_id, user_id)
+            except JournalNotFoundError:
+                log_warning(f"Journal missing during entry update recount for user {user_id}")
+            except SQLAlchemyError as exc:
+                log_error(exc)
+            except Exception as exc:
+                log_error(exc)
 
         log_info(f"Entry updated for user {user_id}: {entry.id}")
         return entry
