@@ -46,7 +46,7 @@ async def get_current_user_info(
     is_oidc_user = user_service.is_oidc_user(str(current_user.id))
 
     # Create response with timezone from settings
-    user_dict = current_user.model_dump()
+    user_dict = current_user.model_dump(mode='json')
     user_dict['time_zone'] = timezone
     user_dict['is_oidc_user'] = is_oidc_user
 
@@ -113,7 +113,7 @@ async def update_current_user(
     # Check if user is OIDC user using service method
     is_oidc_user = user_service.is_oidc_user(str(updated_user.id))
 
-    user_dict = updated_user.model_dump()
+    user_dict = updated_user.model_dump(mode='json')
     user_dict['time_zone'] = timezone
     user_dict['is_oidc_user'] = is_oidc_user
 
@@ -135,12 +135,16 @@ async def delete_current_user(
     session: Annotated[Session, Depends(get_session)]
 ):
     """
-    Delete current user account.
+    Delete current user account and all associated data.
+
+    Users can delete their own accounts regardless of role.
+    This bypasses admin protection (users can delete themselves even if they're the last admin).
     """
     user_service = UserService(session)
 
     try:
-        success = user_service.delete_user(str(current_user.id))
+        # Bypass admin check for self-deletion
+        success = user_service.delete_user(str(current_user.id), bypass_admin_check=True)
 
         if not success:
             raise HTTPException(
