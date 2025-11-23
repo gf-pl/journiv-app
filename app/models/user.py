@@ -10,7 +10,7 @@ from sqlalchemy import Column, ForeignKey
 from sqlmodel import Field, Relationship, Index, CheckConstraint, String
 
 from .base import BaseModel, TimestampMixin
-from .enums import Theme
+from .enums import Theme, UserRole
 
 if TYPE_CHECKING:
     from .journal import Journal
@@ -33,6 +33,7 @@ class User(BaseModel, table=True):
     )
     password: str = Field(..., min_length=8)  # Hashed password
     name: str = Field(..., max_length=100, sa_column=Column(String(100), nullable=False))
+    role: UserRole = Field(default=UserRole.USER, sa_column=Column(String(20), nullable=False, server_default="user"))
     is_active: bool = Field(default=True)
     profile_picture_url: Optional[HttpUrl] = Field(
         default=None,

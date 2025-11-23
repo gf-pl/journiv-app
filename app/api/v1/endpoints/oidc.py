@@ -176,7 +176,15 @@ async def oidc_callback(
         log_error("OIDC claims missing 'sub' field")
         raise HTTPException(status_code=400, detail="Invalid OIDC claims: missing subject")
 
-    if settings.disable_signup:
+    # Get or create user from external identity
+    user_service = UserService(session)
+
+    # Check if this is the first user (bootstrap override)
+    is_first = user_service.is_first_user()
+
+    # If not first user, check signup/auto-provision settings
+    if not is_first and settings.disable_signup:
+        # Check if external identity already exists
         statement = select(ExternalIdentity).where(
             ExternalIdentity.issuer == issuer,
             ExternalIdentity.subject == subject
@@ -190,17 +198,16 @@ async def oidc_callback(
             )
             raise HTTPException(status_code=403, detail="Sign up is disabled")
 
-    # Get or create user from external identity
-    user_service = UserService(session)
-
     try:
+        # First user always gets provisioned as admin (bootstrap override)
+        # Otherwise, respect oidc_auto_provision setting
         user = user_service.get_or_create_user_from_oidc(
             issuer=issuer,
             subject=subject,
             email=email,
             name=name,
             picture=picture,
-            auto_provision=settings.oidc_auto_provision
+            auto_provision=is_first or settings.oidc_auto_provision
         )
     except Exception as exc:
         log_error(f"Failed to provision user from OIDC: {exc}")

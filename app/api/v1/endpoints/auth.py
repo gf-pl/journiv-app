@@ -49,9 +49,13 @@ async def register(
     try:
         user_service = UserService(session)
 
-        if user_service.is_signup_disabled():
+        # Check if this is the first user (bootstrap override)
+        is_first = user_service.is_first_user()
+
+        # Block signup if disabled (unless this is the first user)
+        if not is_first and user_service.is_signup_disabled():
             log_warning(
-                "Email login rejected because signup is disabled",
+                "Email signup rejected because signup is disabled",
                 user_email=user_data.email
             )
             raise HTTPException(status_code=403, detail="Sign up is disabled")
@@ -61,7 +65,7 @@ async def register(
         if existing_user:
             raise HTTPException(status_code=400, detail="Email already registered")
 
-        # Create new user
+        # Create new user (first user becomes admin automatically)
         user = user_service.create_user(user_data)
         log_user_action(user.email, "registered", request_id=getattr(request.state, 'request_id', None))
 
@@ -69,7 +73,7 @@ async def register(
         timezone = user_service.get_user_timezone(user.id)
 
         # Password-registered users are never OIDC users
-        user_dict = user.model_dump()
+        user_dict = user.model_dump(mode='json')
         user_dict['time_zone'] = timezone
         user_dict['is_oidc_user'] = False
 
@@ -142,10 +146,15 @@ async def login(
         timezone = user_service.get_user_timezone(user.id)
 
         # Convert user to dict for response
+        # Handle role - it might be an enum or already a string (from database)
+        # Using str() works for both cases since UserRole is a string enum
+        role_value = str(user.role)
+
         user_dict = {
             "id": str(user.id),
             "email": user.email,
             "name": user.name,
+            "role": role_value,  # Include role field
             "is_active": user.is_active,
             "time_zone": timezone,
             "created_at": user.created_at.isoformat() if user.created_at else None,

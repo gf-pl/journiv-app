@@ -13,6 +13,7 @@ from app.core.database import get_session
 from app.core.security import verify_token
 from app.middleware.request_logging import request_id_ctx
 from app.models.user import User
+from app.models.enums import UserRole
 from app.services.user_service import UserService
 
 logger = logging.getLogger(__name__)
@@ -99,3 +100,29 @@ async def get_current_user(
         )
 
     return user
+
+
+async def get_current_admin_user(
+    current_user: Annotated[User, Depends(get_current_user)]
+) -> User:
+    """
+    Dependency to verify that the current user is an admin.
+    Raises HTTPException with status 403 if user is not an admin.
+
+    Usage:
+        @router.get("/admin/users")
+        async def list_users(admin: Annotated[User, Depends(get_current_admin_user)]):
+            # Only admins can access this endpoint
+            ...
+    """
+    if current_user.role != UserRole.ADMIN:
+        logger.warning(
+            "Non-admin user attempted to access admin endpoint",
+            extra={"user_id": str(current_user.id), "user_email": current_user.email}
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required"
+        )
+
+    return current_user

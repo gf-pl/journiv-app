@@ -7,6 +7,7 @@ from typing import Optional
 
 from pydantic import BaseModel, EmailStr, HttpUrl, validator
 
+from app.models.enums import UserRole
 from app.schemas.base import TimestampMixin
 
 
@@ -65,6 +66,7 @@ class UserUpdate(BaseModel):
 class UserResponse(UserBase, TimestampMixin):
     """User response schema."""
     id: uuid.UUID
+    role: UserRole
     is_active: bool
     profile_picture_url: Optional[HttpUrl] = None
     last_login_at: Optional[datetime] = None
@@ -113,3 +115,63 @@ class UserSettingsResponse(UserSettingsBase, TimestampMixin):
     user_id: uuid.UUID
     created_at: datetime
     updated_at: datetime
+
+
+# Admin-specific schemas
+class AdminUserCreate(UserBase):
+    """Admin user creation schema (can specify role)."""
+    name: str
+    password: str
+    role: Optional[UserRole] = UserRole.USER
+
+    @validator('name')
+    def validate_name(cls, v):
+        if not v or len(v.strip()) == 0:
+            raise ValueError('Name cannot be empty')
+        return v.strip()
+
+
+class AdminUserUpdate(BaseModel):
+    """Admin user update schema (can change role, active status)."""
+    name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    role: Optional[UserRole] = None
+    is_active: Optional[bool] = None
+    password: Optional[str] = None
+
+    @validator('email')
+    def validate_email(cls, v):
+        if v:
+            return v.lower()
+        return v
+
+    @validator('name')
+    def validate_name(cls, v):
+        if v is not None and len(v.strip()) == 0:
+            raise ValueError('Name cannot be empty')
+        return v.strip() if v else v
+
+    @validator('password')
+    def validate_password(cls, v):
+        """Validate password strength."""
+        if v is not None:
+            if len(v) < 8:
+                raise ValueError('Password must be at least 8 characters long')
+            has_letter = any(c.isalpha() for c in v)
+            has_digit = any(c.isdigit() for c in v)
+            if not (has_letter and has_digit):
+                raise ValueError('Password must contain at least one letter and one number')
+        return v
+
+
+class AdminUserListResponse(BaseModel):
+    """Admin user list response with additional metadata."""
+    id: uuid.UUID
+    email: EmailStr
+    name: str
+    role: UserRole
+    is_active: bool
+    last_login_at: Optional[datetime] = None
+    created_at: datetime
+    login_type: str  # "local" or "oidc"
+    linked_providers: Optional[list[str]] = None  # List of OIDC provider names

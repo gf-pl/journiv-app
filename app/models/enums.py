@@ -74,6 +74,12 @@ class TokenType(str, Enum):
     REFRESH = "refresh"
 
 
+class UserRole(str, Enum):
+    """User roles for authorization."""
+    ADMIN = "admin"
+    USER = "user"
+
+
 class JournalColor(str, Enum):
     """Preset colors for journals."""
     RED = "#EF4444"
