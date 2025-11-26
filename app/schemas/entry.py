@@ -3,34 +3,35 @@ Entry schemas.
 """
 import uuid
 from datetime import datetime, date
-from typing import Optional
+from typing import Optional, Dict, Any
 
-from pydantic import BaseModel, validator
+from pydantic import BaseModel
 
 from app.schemas.base import TimestampMixin
 
 
 class EntryBase(BaseModel):
     """Base entry schema."""
-    title: str
-    content: str
+    title: Optional[str] = None
+    content: Optional[str] = None
     entry_date: Optional[date] = None  # Allows backdating/future-dating entries
     entry_datetime_utc: Optional[datetime] = None
     entry_timezone: Optional[str] = None
-    location: Optional[str] = None
-    weather: Optional[str] = None
+
+    # Structured location fields
+    location_json: Optional[Dict[str, Any]] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+
+    # Structured weather fields (Day One import)
+    weather_json: Optional[Dict[str, Any]] = None
+    weather_summary: Optional[str] = None
 
 
 class EntryCreate(EntryBase):
     """Entry creation schema."""
     journal_id: uuid.UUID
     prompt_id: Optional[uuid.UUID] = None
-
-    @validator('title')
-    def validate_title_not_empty(cls, v):
-        if not v or len(v.strip()) == 0:
-            raise ValueError('Title cannot be empty')
-        return v.strip()
 
 
 class EntryUpdate(BaseModel):
@@ -40,8 +41,16 @@ class EntryUpdate(BaseModel):
     entry_date: Optional[date] = None
     entry_datetime_utc: Optional[datetime] = None
     entry_timezone: Optional[str] = None
-    location: Optional[str] = None
-    weather: Optional[str] = None
+
+    # Structured location fields
+    location_json: Optional[Dict[str, Any]] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+
+    # Structured weather fields
+    weather_json: Optional[Dict[str, Any]] = None
+    weather_summary: Optional[str] = None
+
     is_pinned: Optional[bool] = None
     journal_id: Optional[uuid.UUID] = None
 
@@ -64,8 +73,8 @@ class EntryResponse(EntryBase, TimestampMixin):
 class EntryPreviewResponse(TimestampMixin):
     """Entry preview schema for listings (truncated content)."""
     id: uuid.UUID
-    title: str
-    content: str  # Truncated by endpoint
+    title: Optional[str] = None
+    content: Optional[str] = None  # Truncated by endpoint
     journal_id: uuid.UUID
     created_at: datetime
     updated_at: datetime

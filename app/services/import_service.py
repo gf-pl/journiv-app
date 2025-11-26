@@ -32,7 +32,9 @@ from app.utils.import_export import (
     normalize_datetime,
 )
 from app.utils.import_export.constants import ExportConfig
-from app.core.time_utils import local_date_for_user
+from app.core.time_utils import local_date_for_user, utc_now, normalize_timezone
+from app.data_transfer.dayone import DayOneParser, DayOneToJournivMapper
+from app.services.media_storage_service import MediaStorageService
 
 
 class ImportService:
@@ -47,6 +49,7 @@ class ImportService:
         """
         self.db = db
         self.zip_handler = ZipHandler()
+        self.media_storage_service = MediaStorageService(Path(settings.media_root), db)
         self.media_handler = MediaHandler()
 
     def create_import_job(
@@ -125,6 +128,216 @@ class ImportService:
             data = json.load(f)
 
         return data, extract_result.get("media_dir")
+
+    def import_dayone_data(
+        self,
+        user_id: UUID,
+        file_path: Path,
+        *,
+        total_entries: Optional[int] = None,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> ImportResultSummary:
+        """
+        Import Day One export data.
+
+        Args:
+            user_id: User ID to import for
+            file_path: Path to Day One ZIP file
+            total_entries: Total number of entries (for progress tracking)
+            progress_callback: Callback for progress updates
+
+        Returns:
+            ImportResultSummary with statistics
+
+        Raises:
+            ValueError: If data is invalid
+        """
+        log_info(f"Starting Day One import for user {user_id}", user_id=str(user_id), file_path=str(file_path))
+
+        # Create temp directory for extraction
+        temp_dir = Path(settings.import_temp_dir)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        extract_dir = temp_dir / file_path.stem
+        import_timestamp = utc_now()
+
+        try:
+            # Parse Day One ZIP
+            dayone_journals, media_dir = DayOneParser.parse_zip(file_path, extract_dir)
+
+            if not dayone_journals:
+                raise ValueError("No journals found in Day One export")
+
+            # Count total entries for progress tracking
+            if not total_entries:
+                total_entries = sum(len(j.entries) for j in dayone_journals)
+
+            # Initialize tracking
+            summary = ImportResultSummary()
+            id_mapper = IDMapper()
+
+            # Track existing items for deduplication
+            existing_media_checksums = self._get_existing_media_checksums(user_id)
+            existing_tag_names = self._get_existing_tag_names(user_id)
+            existing_mood_names = self._get_existing_mood_names(user_id)
+
+            entries_processed = 0
+
+            def handle_entry_progress():
+                nonlocal entries_processed
+                entries_processed += 1
+                if progress_callback:
+                    progress_callback(entries_processed, total_entries or 0)
+
+            def record_mapping(entity_type: str, external_id: Optional[str], new_id: UUID):
+                if not external_id:
+                    return
+                id_mapper.record(external_id, new_id)
+                summary.id_mappings.setdefault(entity_type, {})[external_id] = str(new_id)
+
+            # Import each Day One journal as a separate Journiv journal
+            for dayone_journal in dayone_journals:
+                try:
+                    # Map entries individually to allow per-entry skips before DTO creation
+                    mapped_entries = []
+                    for entry in dayone_journal.entries:
+                        try:
+                            mapped_entries.append(DayOneToJournivMapper.map_entry(entry))
+                        except Exception as entry_error:  # noqa: BLE001
+                            warning_msg = f"Skipped Day One entry during mapping: {entry_error}"
+                            summary.warnings.append(warning_msg)
+                            summary.entries_skipped += 1
+                            log_warning(warning_msg, user_id=str(user_id), journal_name=dayone_journal.name)
+                            handle_entry_progress()
+
+                    # Map Day One journal to Journiv DTO
+                    journal_dto = DayOneToJournivMapper.map_journal(dayone_journal, mapped_entries=mapped_entries)
+                    source_version = dayone_journal.export_version
+                    if not source_version and dayone_journal.export_metadata:
+                        source_version = dayone_journal.export_metadata.get("version")
+                    journal_dto.import_metadata = {
+                        "source": "dayone",
+                        "source_version": source_version,
+                        "imported_at": import_timestamp.isoformat().replace("+00:00", "Z"),
+                        "export_file": dayone_journal.source_file,
+                        "raw_export_metadata": dayone_journal.export_metadata,
+                    }
+
+                    # Build lookup map for efficient entry matching (O(1) instead of O(n))
+                    dayone_entry_map = {e.uuid: e for e in dayone_journal.entries}
+
+                    # Map media for each entry
+                    for entry_dto in journal_dto.entries:
+                        # Find corresponding Day One entry to get media references
+                        dayone_entry = dayone_entry_map.get(entry_dto.external_id)
+
+                        if dayone_entry and media_dir:
+                            # Map photos
+                            for photo in (dayone_entry.photos or []):
+                                media_path = DayOneParser.find_media_file(
+                                    media_dir,
+                                    photo.identifier,
+                                    md5_hash=photo.md5,
+                                    media_type="photo"
+                                )
+                                if media_path:
+                                    media_dto = DayOneToJournivMapper.map_photo_to_media(
+                                        photo,
+                                        media_path,
+                                        entry_dto.external_id,
+                                        media_base_dir=media_dir,
+                                    )
+                                    if media_dto:
+                                        entry_dto.media.append(media_dto)
+                                else:
+                                    warning_msg = f"Media file not found for photo {photo.identifier}"
+                                    summary.warnings.append(warning_msg)
+                                    summary.media_files_skipped += 1
+
+                            # Map videos
+                            for video in (dayone_entry.videos or []):
+                                media_path = DayOneParser.find_media_file(
+                                    media_dir,
+                                    video.identifier,
+                                    md5_hash=video.md5,
+                                    media_type="video"
+                                )
+                                if media_path:
+                                    media_dto = DayOneToJournivMapper.map_video_to_media(
+                                        video,
+                                        media_path,
+                                        entry_dto.external_id,
+                                        media_base_dir=media_dir,
+                                    )
+                                    if media_dto:
+                                        entry_dto.media.append(media_dto)
+                                else:
+                                    warning_msg = f"Media file not found for video {video.identifier}"
+                                    summary.warnings.append(warning_msg)
+                                    summary.media_files_skipped += 1
+
+                    # Import journal using existing import logic
+                    result = self._import_journal(
+                        user_id=user_id,
+                        journal_dto=journal_dto,
+                        media_dir=media_dir,
+                        id_mapper=id_mapper,
+                        existing_media_checksums=existing_media_checksums,
+                        existing_tag_names=existing_tag_names,
+                        existing_mood_names=existing_mood_names,
+                        summary=summary,
+                        entry_progress_callback=handle_entry_progress,
+                        record_mapping=record_mapping,
+                    )
+                    self.db.commit()
+
+                    # Update summary
+                    summary.journals_created += 1
+                    summary.entries_created += result["entries_created"]
+                    summary.mood_logs_created += result["mood_logs_created"]
+                    summary.media_files_imported += result["media_imported"]
+                    summary.media_files_deduplicated += result["media_deduplicated"]
+                    summary.tags_created += result["tags_created"]
+                    summary.tags_reused += result["tags_reused"]
+
+                except (ValueError, SQLAlchemyError) as journal_error:
+                    self.db.rollback()
+                    warning_msg = (
+                        f"Failed to import Day One journal '{dayone_journal.name}': {journal_error}"
+                    )
+                    log_error(journal_error, user_id=str(user_id), journal_name=dayone_journal.name)
+                    summary.warnings.append(warning_msg)
+                    summary.entries_skipped += len(dayone_journal.entries)
+                except Exception as journal_error:
+                    self.db.rollback()
+                    warning_msg = (
+                        f"Failed to import Day One journal '{dayone_journal.name}': {journal_error}"
+                    )
+                    log_error(journal_error, user_id=str(user_id), journal_name=dayone_journal.name, context="unexpected_journal_import_error")
+                    summary.warnings.append(warning_msg)
+                    summary.entries_skipped += len(dayone_journal.entries)
+
+            log_info(
+                f"Day One import completed: {summary.journals_created} journals, "
+                f"{summary.entries_created} entries, "
+                f"{summary.media_files_imported} media files",
+                user_id=str(user_id),
+                journals_created=summary.journals_created,
+                entries_created=summary.entries_created,
+                media_files_imported=summary.media_files_imported
+            )
+
+            if summary.warnings:
+                log_info(f"Day One import completed with {len(summary.warnings)} warnings", user_id=str(user_id), warning_count=len(summary.warnings))
+
+            return summary
+
+        except Exception as e:
+            self.db.rollback()
+            log_error(e, user_id=str(user_id))
+            raise
+        finally:
+            # Cleanup is handled by caller
+            pass
 
     def import_journiv_data(
         self,
@@ -322,6 +535,7 @@ class ImportService:
             icon=journal_dto.icon,
             is_favorite=journal_dto.is_favorite,
             is_archived=journal_dto.is_archived,
+            import_metadata=journal_dto.import_metadata,
             # Preserve original timestamps from export
             created_at=journal_dto.created_at,
             updated_at=journal_dto.updated_at,
@@ -344,24 +558,30 @@ class ImportService:
 
         # Import entries
         for entry_dto in journal_dto.entries:
-            entry_result = self._import_entry(
-                journal_id=journal.id,
-                user_id=user_id,
-                entry_dto=entry_dto,
-                media_dir=media_dir,
-                existing_media_checksums=existing_media_checksums,
-                existing_tag_names=existing_tag_names,
-                existing_mood_names=existing_mood_names,
-                summary=summary,
-                record_mapping=record_mapping,
-            )
+            try:
+                entry_result = self._import_entry(
+                    journal_id=journal.id,
+                    user_id=user_id,
+                    entry_dto=entry_dto,
+                    media_dir=media_dir,
+                    existing_media_checksums=existing_media_checksums,
+                    existing_tag_names=existing_tag_names,
+                    existing_mood_names=existing_mood_names,
+                    summary=summary,
+                    record_mapping=record_mapping,
+                )
 
-            result["entries_created"] += 1
-            result["mood_logs_created"] += entry_result["mood_logs_created"]
-            result["media_imported"] += entry_result["media_imported"]
-            result["media_deduplicated"] += entry_result["media_deduplicated"]
-            result["tags_created"] += entry_result["tags_created"]
-            result["tags_reused"] += entry_result["tags_reused"]
+                result["entries_created"] += 1
+                result["mood_logs_created"] += entry_result["mood_logs_created"]
+                result["media_imported"] += entry_result["media_imported"]
+                result["media_deduplicated"] += entry_result["media_deduplicated"]
+                result["tags_created"] += entry_result["tags_created"]
+                result["tags_reused"] += entry_result["tags_reused"]
+            except Exception as entry_error:  # noqa: BLE001 - continue on bad entry
+                warning_msg = f"Skipped entry due to error: {entry_error}"
+                summary.warnings.append(warning_msg)
+                summary.entries_skipped += 1
+                log_warning(warning_msg, user_id=str(user_id), journal_id=str(journal.id))
 
             if entry_progress_callback:
                 entry_progress_callback()
@@ -418,9 +638,10 @@ class ImportService:
         # Recalculate entry_date from UTC timestamp and timezone to avoid DST drift
         # This ensures consistency even if the exported entry_date was calculated
         # under different DST rules
+        entry_timezone = normalize_timezone(entry_dto.entry_timezone)
         recalculated_entry_date = local_date_for_user(
             entry_dto.entry_datetime_utc,
-            entry_dto.entry_timezone or "UTC"
+            entry_timezone
         )
 
         # Create entry with proper datetime fields
@@ -431,15 +652,19 @@ class ImportService:
             content=entry_dto.content,
             entry_date=recalculated_entry_date,  # Recalculated local date
             entry_datetime_utc=entry_dto.entry_datetime_utc,  # UTC timestamp
-            entry_timezone=entry_dto.entry_timezone or "UTC",  # IANA timezone, default to UTC
+            entry_timezone=entry_timezone,  # IANA timezone, default to UTC
             word_count=word_count,  # Recalculate from content
             is_pinned=entry_dto.is_pinned,
-            location=entry_dto.location,
-            weather=entry_dto.weather,
+            # Structured location/weather fields
+            location_json=entry_dto.location_json,
+            latitude=entry_dto.latitude,
+            longitude=entry_dto.longitude,
+            weather_json=entry_dto.weather_json,
+            weather_summary=entry_dto.weather_summary,
+            import_metadata=entry_dto.import_metadata,
             # Preserve original timestamps from export
             created_at=entry_dto.created_at,
             updated_at=entry_dto.updated_at,
-            # Note: latitude, longitude, temperature are placeholders (not in DB)
         )
         self.db.add(entry)
         self.db.flush()  # Get entry ID
@@ -467,6 +692,7 @@ class ImportService:
                 result["mood_logs_created"] += 1
 
         # Import media
+        media_map = {}  # Map md5/identifier -> media_id for Day One placeholder replacement
         for media_dto in entry_dto.media:
             media_result = self._import_media(
                 entry_id=entry.id,
@@ -481,6 +707,21 @@ class ImportService:
                 result["media_imported"] += 1
             elif media_result.get("deduplicated"):
                 result["media_deduplicated"] += 1
+
+            # Build photo map for Day One imports (md5 -> media_id)
+            source_key = media_result.get("source_md5") or media_dto.external_id
+            if source_key and media_result.get("media_id"):
+                media_map[source_key] = media_result["media_id"]
+
+        # Replace Day One photo placeholders with Journiv media shortcode format
+        from app.data_transfer.dayone.richtext_parser import DayOneRichTextParser
+        if entry.content and DayOneRichTextParser.PLACEHOLDER_PREFIX in entry.content:
+            entry.content = DayOneRichTextParser.replace_photo_placeholders(
+                entry.content,
+                media_map
+            )
+            # Recalculate word count after content update
+            entry.word_count = len(entry.content.split()) if entry.content else 0
 
         # Import tags
         for tag_name in entry_dto.tags:
@@ -526,9 +767,10 @@ class ImportService:
             return False
 
         # Recalculate logged_date from UTC timestamp and timezone to avoid DST drift
+        logged_timezone = normalize_timezone(mood_log_dto.logged_timezone)
         recalculated_logged_date = local_date_for_user(
             mood_log_dto.logged_datetime_utc,
-            mood_log_dto.logged_timezone or "UTC"
+            logged_timezone
         )
 
         # Create mood log
@@ -539,7 +781,7 @@ class ImportService:
             note=mood_log_dto.note,
             logged_date=recalculated_logged_date,  # Recalculated local date
             logged_datetime_utc=mood_log_dto.logged_datetime_utc,
-            logged_timezone=mood_log_dto.logged_timezone,
+            logged_timezone=logged_timezone,
             # Preserve original timestamps from export
             created_at=mood_log_dto.created_at,
             updated_at=mood_log_dto.updated_at,
@@ -561,7 +803,7 @@ class ImportService:
         Import a media file with deduplication.
 
         Returns:
-            {"imported": True/False, "deduplicated": True/False, "stored_relative_path": str | None}
+            {"imported": True/False, "deduplicated": True/False, "stored_relative_path": str | None, "media_id": str | None}
         """
         # Check if media file exists in media_dir
         if not media_dir:
@@ -569,63 +811,92 @@ class ImportService:
             log_warning(warning_msg, user_id=str(user_id), media_filename=media_dto.filename, entry_id=str(entry_id))
             summary.warnings.append(warning_msg)
             summary.media_files_skipped += 1
-            return {"imported": False, "deduplicated": False, "stored_relative_path": None}
+            return {"imported": False, "deduplicated": False, "stored_relative_path": None, "media_id": None}
 
         if not media_dto.file_path:
             warning_msg = f"Missing file_path for media: {media_dto.filename}"
             log_warning(warning_msg, user_id=str(user_id), media_filename=media_dto.filename, entry_id=str(entry_id))
             summary.warnings.append(warning_msg)
             summary.media_files_skipped += 1
-            return {"imported": False, "deduplicated": False, "stored_relative_path": None}
+            return {"imported": False, "deduplicated": False, "stored_relative_path": None, "media_id": None}
 
-        source_path = media_dir / media_dto.file_path
-        if not source_path.exists():
-            warning_msg = f"Media file not found: {source_path}"
-            log_warning(warning_msg, user_id=str(user_id), media_filename=media_dto.filename, file_path=media_dto.file_path, entry_id=str(entry_id))
+        source_path = Path(media_dto.file_path)
+        if not source_path.is_absolute():
+            source_path = media_dir / source_path
+
+        # Ensure media lives under the extracted media directory to prevent traversal
+        resolved_source = source_path.resolve()
+        media_root = media_dir.resolve()
+        try:
+            resolved_source.relative_to(media_root)
+        except ValueError:
+            warning_msg = f"Media file outside expected directory: {resolved_source}"
+            log_warning(
+                warning_msg,
+                user_id=str(user_id),
+                media_filename=media_dto.filename,
+                file_path=media_dto.file_path,
+                entry_id=str(entry_id),
+            )
             summary.warnings.append(warning_msg)
             summary.media_files_skipped += 1
-            return {"imported": False, "deduplicated": False, "stored_relative_path": None}
+            return {"imported": False, "deduplicated": False, "stored_relative_path": None, "media_id": None}
+
+        if not resolved_source.exists():
+            warning_msg = f"Media file not found: {resolved_source}"
+            log_warning(warning_msg, user_id=str(user_id), media_filename=media_dto.filename, file_path=str(resolved_source), entry_id=str(entry_id))
+            summary.warnings.append(warning_msg)
+            summary.media_files_skipped += 1
+            return {"imported": False, "deduplicated": False, "stored_relative_path": None, "media_id": None}
+
+        # Normalize to resolved path for subsequent operations
+        source_path = resolved_source
+
+        # Detect Day One md5 from filename (stem)
+        # Day One export filenames for media use the MD5 hash as the filename stem per Day One's export format,
+        # so extracting source_path.stem yields the media MD5. When that convention isn't present, the code
+        # falls back to external_id (see usage around line 712). Maintainers should consult Day One export
+        # docs if behavior changes.
+        source_md5 = source_path.stem if source_path.stem else None
 
         # Choose media subdirectory based on type
-        media_type = media_dto.media_type.lower() if media_dto.media_type else "unknown"
-        if media_type.startswith("image"):
-            subdir = "images"
-        elif media_type.startswith("video"):
-            subdir = "videos"
-        elif media_type.startswith("audio"):
-            subdir = "audio"
+        media_type_str = media_dto.media_type.lower() if media_dto.media_type else "unknown"
+        if media_type_str.startswith("image"):
+            media_type_dir = "images"
+        elif media_type_str.startswith("video"):
+            media_type_dir = "videos"
+        elif media_type_str.startswith("audio"):
+            media_type_dir = "audio"
         else:
-            subdir = "files"
+            media_type_dir = "images"  # Default to images for unknown types
 
-        media_root = Path(settings.media_root)
-        dest_dir = media_root / subdir
-        dest_dir.mkdir(parents=True, exist_ok=True)
+        # Store media using unified storage service (per-user deduplication)
+        relative_path, checksum, was_deduplicated = self.media_storage_service.store_media(
+            source=source_path,
+            user_id=str(user_id),
+            media_type=media_type_dir,
+            extension=source_path.suffix,
+            checksum=None  # Will be calculated by storage service
+        )
 
-        # Stream copy while calculating checksum to avoid double reads
-        tmp_path = dest_dir / f"tmp_{uuid4().hex}{source_path.suffix}"
-        sha256 = MediaHandler.sha256_hasher()
+        # Track checksum for in-memory deduplication tracking
+        existing_checksums.add(checksum)
 
-        with open(source_path, "rb") as src, open(tmp_path, "wb") as dst:
-            for chunk in iter(lambda: src.read(8192), b""):
-                sha256.update(chunk)
-                dst.write(chunk)
-
-        checksum = sha256.hexdigest()
-
-        # Check for duplicate by checksum
-        if checksum in existing_checksums:
+        # If deduplicated, find existing media and create reference
+        if was_deduplicated:
             existing_media = (
                 self.db.query(EntryMedia)
                 .join(Entry)
+                .join(Journal)
                 .filter(
-                    Entry.user_id == user_id,
+                    Journal.user_id == user_id,
                     EntryMedia.checksum == checksum
                 )
                 .first()
             )
 
             if existing_media:
-                tmp_path.unlink(missing_ok=True)
+                # Create new EntryMedia record referencing the same file
                 media = EntryMedia(
                     entry_id=entry_id,
                     file_path=existing_media.file_path,
@@ -647,35 +918,34 @@ class ImportService:
                 self.db.add(media)
                 if record_mapping and media_dto.external_id:
                     record_mapping("media", media_dto.external_id, media.id)
+
+                log_info(
+                    "Media deduplicated during import",
+                    checksum=checksum,
+                    user_id=str(user_id),
+                    relative_path=relative_path
+                )
+
                 return {
                     "imported": False,
                     "deduplicated": True,
                     "stored_relative_path": existing_media.file_path,
                     "stored_filename": Path(existing_media.file_path).name,
+                    "source_md5": source_md5,
+                    "media_id": str(media.id),
                 }
 
-        # Final filename uses checksum for uniqueness
-        target_name = f"{checksum}{source_path.suffix}"
-        dest_path = dest_dir / target_name
-        counter = 1
-        while dest_path.exists():
-            dest_path = dest_dir / f"{checksum}_{counter}{source_path.suffix}"
-            counter += 1
+        # File is new - create media record
+        full_path = self.media_storage_service.get_full_path(relative_path)
 
-        tmp_path.rename(dest_path)
-
-        relative_path = f"{subdir}/{dest_path.name}"
-
-        # Create media record
         media = self._create_media_record(
             entry_id=entry_id,
             file_path=relative_path,
             media_dto=media_dto,
             checksum=checksum,
-            file_size=dest_path.stat().st_size,
+            file_size=full_path.stat().st_size,
         )
         self.db.add(media)
-        existing_checksums.add(checksum)
 
         # Generate thumbnail for imported media
         if media.media_type in [MediaType.IMAGE, MediaType.VIDEO]:
@@ -684,7 +954,6 @@ class ImportService:
                 media_service = MediaService(self.db)
 
                 # Generate thumbnail synchronously
-                full_path = Path(settings.media_root) / relative_path
                 if not full_path.exists():
                     log_warning(f"Media file not found for thumbnail generation: {full_path}", media_id=str(media.id), file_path=str(full_path))
                 else:
@@ -708,7 +977,9 @@ class ImportService:
             "imported": True,
             "deduplicated": False,
             "stored_relative_path": relative_path,
-            "stored_filename": dest_path.name,
+            "stored_filename": Path(relative_path).name,
+            "source_md5": source_md5,
+            "media_id": str(media.id),
         }
 
     def _parse_media_type(self, media_type_str: str) -> MediaType:
@@ -790,36 +1061,27 @@ class ImportService:
         """
         tag_name_lower = tag_name.strip().lower()
 
-        # Fast-path: check if tag already exists in set
-        if tag_name_lower in existing_tag_names:
-            # Tag exists, just need to link it
-            tag = (
-                self.db.query(Tag)
-                .filter(
-                    Tag.user_id == user_id,
-                    Tag.name == tag_name_lower
-                )
-                .first()
+        # Single query regardless of whether tag is in cache
+        tag = (
+            self.db.query(Tag)
+            .filter(
+                Tag.user_id == user_id,
+                Tag.name == tag_name_lower
             )
-            created = False
-        else:
-            # Tag doesn't exist in set, check DB and create if needed
-            tag = (
-                self.db.query(Tag)
-                .filter(
-                    Tag.user_id == user_id,
-                    Tag.name == tag_name_lower
-                )
-                .first()
-            )
+            .first()
+        )
 
-            created = False
-            if not tag:
-                tag = Tag(user_id=user_id, name=tag_name_lower)
-                self.db.add(tag)
-                self.db.flush()
-                existing_tag_names.add(tag_name_lower)
-                created = True
+        created = False
+        if not tag:
+            # Tag doesn't exist, create it
+            tag = Tag(user_id=user_id, name=tag_name_lower)
+            self.db.add(tag)
+            self.db.flush()
+            existing_tag_names.add(tag_name_lower)
+            created = True
+        elif tag_name_lower not in existing_tag_names:
+            # Tag exists in DB but not in cache, update cache
+            existing_tag_names.add(tag_name_lower)
 
         # Link tag to entry
         from app.models.entry_tag_link import EntryTagLink

@@ -78,7 +78,7 @@ async def upload_media(
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[Session, Depends(_get_db_session)],
     file: UploadFile = File(...),
-    entry_id: Optional[uuid.UUID] = Form(None),
+    entry_id: uuid.UUID = Form(...),
     alt_text: Optional[str] = Form(None),
 ):
     """

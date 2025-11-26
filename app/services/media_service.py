@@ -23,6 +23,7 @@ from app.core.exceptions import (
     MediaNotFoundError,
     FileTooLargeError,
     InvalidFileTypeError,
+    InvalidMediaTypeError,
     FileValidationError,
     EntryNotFoundError
 )
@@ -31,6 +32,7 @@ from app.models.entry import Entry, EntryMedia
 from app.models.enums import MediaType, UploadStatus
 from app.models.journal import Journal
 from app.utils.import_export.media_handler import MediaHandler
+from app.services.media_storage_service import MediaStorageService
 
 try:
     from PIL import Image
@@ -65,6 +67,9 @@ class MediaService:
         self.media_root = Path(self.settings.media_root).resolve()
         self.media_root.mkdir(parents=True, exist_ok=True)
 
+        # Initialize media storage service for unified storage
+        self.media_storage_service = MediaStorageService(self.media_root, session)
+
         # Cache libmagic detector if available; fall back to best-effort detection
         try:
             self._magic = magic.Magic(mime=True)
@@ -75,12 +80,6 @@ class MediaService:
         # Build allowlists for MIME types and extensions from settings for configurability
         self.allowed_mime_types = {mime.lower() for mime in (self.settings.allowed_media_types or [])}
         self.allowed_extensions = {ext.lower() for ext in (self.settings.allowed_file_extensions or [])}
-
-        # Pre-create media directories
-        for folder in ("images", "videos", "audio"):
-            target = self.media_root / folder
-            target.mkdir(parents=True, exist_ok=True)
-            (target / "thumbnails").mkdir(parents=True, exist_ok=True)
 
     def _get_session(self, session: Optional[Session]) -> Session:
         effective = session or self.session
@@ -169,45 +168,66 @@ class MediaService:
         user_id: str,
         media_type: MediaType
     ) -> Dict[str, Any]:
-        """Save an uploaded file quickly without processing (for async processing)."""
-        # Generate unique filename
-        filename = self._generate_filename(original_filename, user_id)
-        file_path = self._get_media_path(filename, media_type)
+        """
+        Save an uploaded file using unified MediaStorageService.
 
-        tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
-        async with aiofiles.open(tmp_path, 'wb') as f:
-            await f.write(file_content)
-            await f.flush()
+        Args:
+            file_content: File content as bytes
+            original_filename: Original filename from upload
+            user_id: User UUID string
+            media_type: MediaType enum
 
-        try:
-            await aiofiles.os.rename(tmp_path, file_path)
-        except Exception:
-            # Attempt cleanup and re-raise
-            try:
-                await aiofiles.os.remove(tmp_path)
-            except FileNotFoundError:
-                pass
-            raise
+        Returns:
+            Dict with file metadata
+        """
+        # Determine media type directory
+        media_type_lower = self._normalize_media_type(media_type)
+        if media_type_lower == "image":
+            media_type_dir = "images"
+        elif media_type_lower == "video":
+            media_type_dir = "videos"
+        elif media_type_lower == "audio":
+            media_type_dir = "audio"
+        else:
+            raise InvalidMediaTypeError(
+                f"Invalid or unrecognized media type: original={media_type!r}, normalized={media_type_lower!r}"
+            )
 
-        # Get basic metadata
+        # Get file extension
+        safe_original = MediaHandler.sanitize_filename(original_filename)
+        extension = Path(safe_original).suffix or ".bin"
+
+        # Create BytesIO stream from content
+        file_stream = BytesIO(file_content)
+
+        # Store using unified storage service (per-user deduplication)
+        # Run synchronously - file I/O is blocking anyway
+        relative_path, checksum, was_deduplicated = await asyncio.to_thread(
+            self.media_storage_service.store_media,
+            source=file_stream,
+            user_id=user_id,
+            media_type=media_type_dir,
+            extension=extension,
+            checksum=None  # Will be calculated
+        )
+
+        # Get metadata
         file_size = len(file_content)
         mime_type = self._detect_mime(file_content)
-        checksum = hashlib.sha256(file_content).hexdigest()
-
-        # Return relative paths for API responses
-        relative_file_path = str(file_path.relative_to(self.media_root))
+        full_file_path = self.media_storage_service.get_full_path(relative_path)
 
         return {
-            "filename": filename,
-            "file_path": relative_file_path,
-            "original_filename": MediaHandler.sanitize_filename(original_filename),
+            "filename": Path(relative_path).name,
+            "file_path": relative_path,
+            "original_filename": safe_original,
             "file_size": file_size,
             "mime_type": mime_type,
             "thumbnail_path": None,  # Will be generated in background
             "media_type": media_type,
             "upload_status": UploadStatus.PENDING,
             "checksum": checksum,
-            "full_file_path": str(file_path)  # For background processing
+            "full_file_path": str(full_file_path),  # For background processing
+            "was_deduplicated": was_deduplicated
         }
 
     async def get_media_info(self, file_path: str) -> Dict[str, Any]:
@@ -284,24 +304,6 @@ class MediaService:
             "created_at": datetime.fromtimestamp(stat.st_ctime),
             "modified_at": datetime.fromtimestamp(stat.st_mtime)
         }
-
-    async def delete_media_file(self, file_path: str) -> bool:
-        """Delete a media file and its thumbnail."""
-        path = Path(file_path)
-        if not path.exists():
-            return False
-
-        # Delete main file
-        path.unlink()
-
-        # Delete thumbnail if it exists
-        thumb_name = f"thumb_{path.stem}.jpg"
-        for candidate_type in (MediaType.IMAGE, MediaType.VIDEO, MediaType.AUDIO):
-            thumbnail_path = self._get_thumbnail_path(thumb_name, candidate_type)
-            if thumbnail_path and thumbnail_path.exists():
-                thumbnail_path.unlink(missing_ok=True)
-
-        return True
 
     def _validate_file_internal(self, file_content: bytes, filename: str) -> Tuple[bool, str]:
         """Core validation logic shared by all validation methods.
@@ -421,7 +423,7 @@ class MediaService:
         self,
         file: UploadFile,
         user_id: uuid.UUID,
-        entry_id: Optional[uuid.UUID] = None,
+        entry_id: uuid.UUID,
         alt_text: Optional[str] = None,
         session: Optional[Session] = None
     ) -> Dict[str, Any]:
@@ -433,7 +435,7 @@ class MediaService:
         Args:
             file: The uploaded file
             user_id: ID of the user uploading the file
-            entry_id: Optional ID of the entry to attach media to
+            entry_id: ID of the entry to attach media to
             alt_text: Optional alt text for the media
             session: Optional database session for creating media record
 
@@ -444,7 +446,7 @@ class MediaService:
             FileTooLargeError: If file exceeds size limit
             FileValidationError: If file validation fails
             InvalidFileTypeError: If file type is not supported
-            EntryNotFoundError: If entry_id is provided but entry doesn't exist
+            EntryNotFoundError: If entry doesn't exist
         """
         # 1. Check file size before reading
         await self._check_file_size(file)
@@ -468,7 +470,11 @@ class MediaService:
         # 4. Detect media type
         media_type = self._detect_media_type(file_content)
 
-        # 5. Save file
+        # 5. Verify entry exists and belongs to user
+        db_session = self._get_session(session)
+        self._get_entry_for_user(db_session, entry_id, user_id)
+
+        # 6. Save file
         media_info = await self.save_uploaded_file(
             file_content,
             file.filename or "unknown",
@@ -477,10 +483,43 @@ class MediaService:
         )
 
         media_record = None
-        if entry_id:
-            db_session = self._get_session(session)
-            self._get_entry_for_user(db_session, entry_id, user_id)
+        db_session = self._get_session(session)
 
+        # If file was deduplicated, try to find existing media with same checksum
+        existing_media = None
+        if media_info.get("was_deduplicated"):
+            stmt = (
+                select(EntryMedia)
+                .join(Entry)
+                .join(Journal)
+                .where(
+                    EntryMedia.checksum == media_info["checksum"],
+                    Journal.user_id == user_id
+                )
+            )
+            existing_media = db_session.exec(stmt).first()
+
+        if existing_media:
+            # Reuse existing media metadata, create new record for this entry
+            media_record = EntryMedia(
+                entry_id=entry_id,
+                media_type=existing_media.media_type,
+                file_path=existing_media.file_path,
+                original_filename=media_info["original_filename"],
+                file_size=existing_media.file_size,
+                mime_type=existing_media.mime_type,
+                thumbnail_path=existing_media.thumbnail_path,
+                alt_text=alt_text,
+                upload_status=existing_media.upload_status,
+                file_metadata=existing_media.file_metadata,
+                checksum=existing_media.checksum,
+                width=existing_media.width,
+                height=existing_media.height,
+                duration=existing_media.duration,
+            )
+            logger.info(f"Reused deduplicated media for user {user_id}, checksum {media_info['checksum'][:16]}")
+        else:
+            # Create new media record
             media_record = EntryMedia(
                 entry_id=entry_id,
                 media_type=media_type,
@@ -495,23 +534,34 @@ class MediaService:
                 checksum=media_info.get("checksum"),
             )
 
-            try:
-                db_session.add(media_record)
-                db_session.commit()
-                db_session.refresh(media_record)
-            except SQLAlchemyError as exc:
-                db_session.rollback()
-                log_error(exc)
-                await self.delete_media_file(media_info["full_file_path"])
-                raise
+        try:
+            db_session.add(media_record)
+            db_session.commit()
+            db_session.refresh(media_record)
+        except SQLAlchemyError as exc:
+            db_session.rollback()
+            log_error(exc)
+            # Only delete file if it wasn't deduplicated
+            if not media_info.get("was_deduplicated"):
+                # Force delete since DB record was never committed
+                try:
+                    self.media_storage_service.delete_media(
+                        relative_path=media_info["file_path"],
+                        checksum=media_info["checksum"],
+                        user_id=str(user_id),
+                        force=True  # Force deletion since no DB record exists
+                    )
+                except Exception as delete_exc:
+                    log_warning(f"Failed to cleanup uploaded file after DB error: {delete_exc}")
+            raise
 
-            log_file_upload(
-                media_record.original_filename or media_record.file_path,
-                media_info["file_size"],
-                True,
-                request_id="",
-                user_email=str(user_id),
-            )
+        log_file_upload(
+            media_record.original_filename or media_record.file_path,
+            media_info["file_size"],
+            True,
+            request_id="",
+            user_email=str(user_id),
+        )
         return {
             "media_record": media_record,
             "full_file_path": media_info["full_file_path"],
@@ -970,16 +1020,17 @@ class MediaService:
         """
         from app.services import entry_service as entry_service_module
 
-        # Get media record first to get file path and thumbnail path
+        # Get media record first to get file path, checksum, and thumbnail path
         media = self.get_media_by_id(media_id, user_id, session)
         file_path = media.file_path
+        checksum = media.checksum
         thumbnail_path = media.thumbnail_path
 
         # Delete database record using entry service
         entry_service = entry_service_module.EntryService(session)
         entry_service.delete_entry_media(media_id, user_id)
 
-        # Delete thumbnail file if it exists
+        # Delete thumbnail file if it exists (thumbnails are not deduplicated)
         if thumbnail_path:
             try:
                 full_thumbnail_path = (self.media_root / thumbnail_path).resolve()
@@ -988,14 +1039,24 @@ class MediaService:
             except Exception as e:
                 log_error(f"Failed to delete thumbnail file: {e}")
 
-        # Delete file from filesystem
-        try:
-            full_path = (self.media_root / file_path).resolve()
-            if full_path.exists() and str(full_path).startswith(str(self.media_root.resolve())):
-                await self.delete_media_file(str(full_path))
-        except Exception as e:
-            # Log error but don't fail since DB record is already deleted
-            log_error(f"Failed to delete media file: {e}")
+        # Delete file from filesystem using reference counting
+        # Create storage service with fresh session AFTER commit to get accurate reference counts
+        if checksum:
+            try:
+                from app.core.database import get_session_context
+
+                # Create a new session for reference counting (after DB records are deleted)
+                with get_session_context() as fresh_session:
+                    media_storage_service = MediaStorageService(self.media_root, fresh_session)
+                    media_storage_service.delete_media(
+                        relative_path=file_path,
+                        checksum=checksum,
+                        user_id=str(user_id),
+                        force=False
+                    )
+            except Exception as e:
+                # Log error but don't fail since DB record is already deleted
+                log_error(f"Failed to delete media file: {e}")
 
     def get_media_file_for_serving(self, media_id: uuid.UUID, user_id: uuid.UUID, session: Session, range_header: Optional[str] = None) -> Dict[str, Any]:
         """Get media file information for serving with optional range support.

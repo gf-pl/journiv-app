@@ -5,9 +5,10 @@ import uuid
 from datetime import date, datetime
 from typing import List, Optional, TYPE_CHECKING
 
-from pydantic import field_validator
-from sqlalchemy import Column, ForeignKey, Enum as SAEnum, UniqueConstraint, String, DateTime
-from sqlmodel import Field, Relationship, Index, CheckConstraint
+from pydantic import field_validator, model_validator
+from sqlalchemy import Column, ForeignKey, Enum as SAEnum, UniqueConstraint, String, DateTime, Float
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlmodel import Field, Relationship, Index, CheckConstraint, Column as SQLModelColumn, JSON
 
 from app.core.time_utils import utc_now
 from .base import BaseModel
@@ -24,13 +25,17 @@ if TYPE_CHECKING:
 from .entry_tag_link import EntryTagLink
 
 
+def JSONType():
+    return JSONB().with_variant(JSON, "sqlite")
+
+
 class Entry(BaseModel, table=True):
     """
     Journal entry model
     """
     __tablename__ = "entry"
     title: Optional[str] = Field(None, max_length=300)
-    content: str = Field(..., min_length=1, max_length=100000)  # 100K character limit
+    content: Optional[str] = Field(None, max_length=100000)  # 100K character limit
     journal_id: uuid.UUID = Field(
         sa_column=Column(
             ForeignKey("journal.id", ondelete="CASCADE"),
@@ -56,8 +61,40 @@ class Entry(BaseModel, table=True):
     )
     word_count: int = Field(default=0, ge=0, le=50000)  # Reasonable word count limit
     is_pinned: bool = Field(default=False)
-    location: Optional[str] = Field(None, max_length=200)
-    weather: Optional[str] = Field(None, max_length=100)
+
+    # Structured location fields
+    location_json: Optional[dict] = Field(
+        default=None,
+        sa_column=SQLModelColumn(JSONType()),
+        description="Structured location data: {name, street, locality, admin_area, country, latitude, longitude, timezone}"
+    )
+    latitude: Optional[float] = Field(
+        default=None,
+        sa_column=Column(Float, nullable=True),
+        description="GPS latitude"
+    )
+    longitude: Optional[float] = Field(
+        default=None,
+        sa_column=Column(Float, nullable=True),
+        description="GPS longitude"
+    )
+
+    # Structured weather fields (new)
+    weather_json: Optional[dict] = Field(
+        default=None,
+        sa_column=SQLModelColumn(JSONType()),
+        description="Structured weather data: {temp_c, condition, code, service}"
+    )
+    weather_summary: Optional[str] = Field(
+        None,
+        description="Human-readable weather summary"
+    )
+    import_metadata: Optional[dict] = Field(
+        default=None,
+        sa_column=SQLModelColumn(JSONType()),
+        description="Import metadata for preserving source details"
+    )
+
     user_id: uuid.UUID = Field(
         sa_column=Column(
             ForeignKey("user.id", ondelete="CASCADE"),
@@ -89,9 +126,9 @@ class Entry(BaseModel, table=True):
         Index('idx_entries_created_at', 'created_at'),
         Index('idx_entries_prompt_id', 'prompt_id'),
         Index('idx_entry_user_datetime', 'user_id', 'entry_datetime_utc'),
+        Index('idx_entry_latitude_longitude', 'latitude', 'longitude'),
 
         # Constraints
-        CheckConstraint('length(content) > 0', name='check_content_not_empty'),
         CheckConstraint('word_count >= 0', name='check_word_count_positive'),
     )
 
@@ -105,16 +142,44 @@ class Entry(BaseModel, table=True):
     @field_validator('content')
     @classmethod
     def validate_content(cls, v):
-        if not v or len(v.strip()) == 0:
-            raise ValueError('Content cannot be empty')
-        return v.strip()
-
-    @field_validator('location')
-    @classmethod
-    def validate_location(cls, v):
-        if v and len(v.strip()) == 0:
+        if v is None:
             return None
-        return v.strip() if v else v
+        cleaned = v.strip()
+        return cleaned if cleaned else None
+
+    @field_validator('latitude')
+    @classmethod
+    def validate_latitude(cls, v):
+        if v is not None and not (-90 <= v <= 90):
+            raise ValueError(f'Latitude must be between -90 and 90, got {v}')
+        return v
+
+    @field_validator('longitude')
+    @classmethod
+    def validate_longitude(cls, v):
+        if v is not None and not (-180 <= v <= 180):
+            raise ValueError(f'Longitude must be between -180 and 180, got {v}')
+        return v
+
+    @model_validator(mode='after')
+    def validate_location_consistency(self):
+        if self.location_json and isinstance(self.location_json, dict):
+            loc_lat = self.location_json.get('latitude')
+            loc_lon = self.location_json.get('longitude')
+
+            if loc_lat is not None:
+                if not (-90 <= loc_lat <= 90):
+                    raise ValueError(f'Latitude in location_json must be between -90 and 90, got {loc_lat}')
+                if self.latitude is not None and abs(self.latitude - loc_lat) > 0.0001:
+                    raise ValueError(f'latitude field ({self.latitude}) does not match location_json.latitude ({loc_lat})')
+
+            if loc_lon is not None:
+                if not (-180 <= loc_lon <= 180):
+                    raise ValueError(f'Longitude in location_json must be between -180 and 180, got {loc_lon}')
+                if self.longitude is not None and abs(self.longitude - loc_lon) > 0.0001:
+                    raise ValueError(f'longitude field ({self.longitude}) does not match location_json.longitude ({loc_lon})')
+
+        return self
 
 
 class EntryMedia(BaseModel, table=True):
