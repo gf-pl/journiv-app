@@ -38,6 +38,11 @@ class MediaHandler:
     AUDIO_EXTENSIONS: ClassVar[set[str]] = {".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac", ".wma"}
 
     @staticmethod
+    def sha256_hasher() -> "hashlib._Hash":
+        """Return a new sha256 hasher (helper to enable injection/testing)."""
+        return hashlib.sha256()
+
+    @staticmethod
     def calculate_checksum(file_path: Path) -> str:
         """
         Calculate SHA256 checksum of a file.

@@ -6,7 +6,7 @@ Handles the business logic for importing data from various sources.
 import shutil
 from pathlib import Path
 from typing import Dict, Any, Optional, Callable
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy.orm import Session
 from sqlalchemy import select, func
@@ -556,12 +556,12 @@ class ImportService:
         existing_checksums: set,
         summary: ImportResultSummary,
         record_mapping: Optional[Callable[[str, Optional[str], UUID], None]] = None,
-    ) -> Dict[str, bool]:
+    ) -> Dict[str, Any]:
         """
         Import a media file with deduplication.
 
         Returns:
-            {"imported": True/False, "deduplicated": True/False}
+            {"imported": True/False, "deduplicated": True/False, "stored_relative_path": str | None}
         """
         # Check if media file exists in media_dir
         if not media_dir:
@@ -569,16 +569,14 @@ class ImportService:
             log_warning(warning_msg, user_id=str(user_id), media_filename=media_dto.filename, entry_id=str(entry_id))
             summary.warnings.append(warning_msg)
             summary.media_files_skipped += 1
-            return {"imported": False, "deduplicated": False}
+            return {"imported": False, "deduplicated": False, "stored_relative_path": None}
 
-        # Use file_path (which includes subdirectory like "videos/..." or "images/...")
-        # instead of just filename
         if not media_dto.file_path:
             warning_msg = f"Missing file_path for media: {media_dto.filename}"
             log_warning(warning_msg, user_id=str(user_id), media_filename=media_dto.filename, entry_id=str(entry_id))
             summary.warnings.append(warning_msg)
             summary.media_files_skipped += 1
-            return {"imported": False, "deduplicated": False}
+            return {"imported": False, "deduplicated": False, "stored_relative_path": None}
 
         source_path = media_dir / media_dto.file_path
         if not source_path.exists():
@@ -586,16 +584,36 @@ class ImportService:
             log_warning(warning_msg, user_id=str(user_id), media_filename=media_dto.filename, file_path=media_dto.file_path, entry_id=str(entry_id))
             summary.warnings.append(warning_msg)
             summary.media_files_skipped += 1
-            return {"imported": False, "deduplicated": False}
+            return {"imported": False, "deduplicated": False, "stored_relative_path": None}
 
-        # Calculate checksum if not provided
-        checksum = media_dto.checksum
-        if not checksum:
-            checksum = self.media_handler.calculate_checksum(source_path)
+        # Choose media subdirectory based on type
+        media_type = media_dto.media_type.lower() if media_dto.media_type else "unknown"
+        if media_type.startswith("image"):
+            subdir = "images"
+        elif media_type.startswith("video"):
+            subdir = "videos"
+        elif media_type.startswith("audio"):
+            subdir = "audio"
+        else:
+            subdir = "files"
+
+        media_root = Path(settings.media_root)
+        dest_dir = media_root / subdir
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        # Stream copy while calculating checksum to avoid double reads
+        tmp_path = dest_dir / f"tmp_{uuid4().hex}{source_path.suffix}"
+        sha256 = MediaHandler.sha256_hasher()
+
+        with open(source_path, "rb") as src, open(tmp_path, "wb") as dst:
+            for chunk in iter(lambda: src.read(8192), b""):
+                sha256.update(chunk)
+                dst.write(chunk)
+
+        checksum = sha256.hexdigest()
 
         # Check for duplicate by checksum
         if checksum in existing_checksums:
-            # File already exists - find existing media record
             existing_media = (
                 self.db.query(EntryMedia)
                 .join(Entry)
@@ -607,56 +625,48 @@ class ImportService:
             )
 
             if existing_media:
-                # Create media record pointing to existing file (deduplication)
-                # Use canonical metadata from existing media record for consistency
+                tmp_path.unlink(missing_ok=True)
                 media = EntryMedia(
                     entry_id=entry_id,
                     file_path=existing_media.file_path,
-                    original_filename=media_dto.filename,  # Keep DTO filename for this entry's context
-                    media_type=existing_media.media_type,  # Use canonical type
-                    file_size=existing_media.file_size,  # Use canonical size
-                    mime_type=existing_media.mime_type,  # Use canonical mime type
+                    original_filename=media_dto.filename,
+                    media_type=existing_media.media_type,
+                    file_size=existing_media.file_size,
+                    mime_type=existing_media.mime_type,
                     checksum=checksum,
-                    thumbnail_path=existing_media.thumbnail_path,  # Use canonical thumbnail
-                    width=existing_media.width,  # Use canonical dimensions
+                    thumbnail_path=existing_media.thumbnail_path,
+                    width=existing_media.width,
                     height=existing_media.height,
                     duration=existing_media.duration,
-                    alt_text=media_dto.alt_text or media_dto.caption,  # Use DTO alt text/caption
-                    upload_status=existing_media.upload_status,  # Use canonical status
-                    file_metadata=existing_media.file_metadata,  # Use canonical metadata
-                    created_at=media_dto.created_at,  # Preserve original timestamps from export
+                    alt_text=media_dto.alt_text or media_dto.caption,
+                    upload_status=existing_media.upload_status,
+                    file_metadata=existing_media.file_metadata,
+                    created_at=media_dto.created_at,
                     updated_at=media_dto.updated_at,
                 )
                 self.db.add(media)
                 if record_mapping and media_dto.external_id:
                     record_mapping("media", media_dto.external_id, media.id)
-                return {"imported": False, "deduplicated": True}
+                return {
+                    "imported": False,
+                    "deduplicated": True,
+                    "stored_relative_path": existing_media.file_path,
+                    "stored_filename": Path(existing_media.file_path).name,
+                }
 
-        # Copy media file to user's media directory
-        user_media_dir = Path(settings.media_root) / str(user_id)
-        user_media_dir.mkdir(parents=True, exist_ok=True)
-
-        # Sanitize filename
-        safe_filename = self.media_handler.sanitize_filename(media_dto.filename)
-        dest_path = user_media_dir / safe_filename
-
-        # Handle filename conflicts
+        # Final filename uses checksum for uniqueness
+        target_name = f"{checksum}{source_path.suffix}"
+        dest_path = dest_dir / target_name
         counter = 1
         while dest_path.exists():
-            stem = Path(safe_filename).stem
-            suffix = Path(safe_filename).suffix
-            safe_filename = f"{stem}_{counter}{suffix}"
-            dest_path = user_media_dir / safe_filename
+            dest_path = dest_dir / f"{checksum}_{counter}{source_path.suffix}"
             counter += 1
 
-        # Copy file
-        shutil.copy2(source_path, dest_path)
+        tmp_path.rename(dest_path)
 
-        # Store relative path from media_root for consistency
-        # This ensures media files can be relocated and paths remain valid
-        relative_path = str(dest_path.relative_to(Path(settings.media_root)))
+        relative_path = f"{subdir}/{dest_path.name}"
 
-        # Create media record with actual file size from copied file
+        # Create media record
         media = self._create_media_record(
             entry_id=entry_id,
             file_path=relative_path,
@@ -666,10 +676,40 @@ class ImportService:
         )
         self.db.add(media)
         existing_checksums.add(checksum)
+
+        # Generate thumbnail for imported media
+        if media.media_type in [MediaType.IMAGE, MediaType.VIDEO]:
+            try:
+                from app.services.media_service import MediaService
+                media_service = MediaService(self.db)
+
+                # Generate thumbnail synchronously
+                full_path = Path(settings.media_root) / relative_path
+                if not full_path.exists():
+                    log_warning(f"Media file not found for thumbnail generation: {full_path}", media_id=str(media.id), file_path=str(full_path))
+                else:
+                    thumbnail_path = media_service._generate_thumbnail(
+                        str(full_path),
+                        media.media_type
+                    )
+
+                    if thumbnail_path:
+                        # Convert to relative path
+                        media.thumbnail_path = media_service._relative_thumbnail_path(Path(thumbnail_path))
+                        log_info(f"Generated thumbnail for imported media: {media.id}", media_id=str(media.id))
+            except Exception as thumb_error:
+                # Log but don't fail import if thumbnail generation fails
+                log_warning(f"Failed to generate thumbnail for imported media {media.id}: {thumb_error}", media_id=str(media.id))
+
         if record_mapping and media_dto.external_id:
             record_mapping("media", media_dto.external_id, media.id)
 
-        return {"imported": True, "deduplicated": False}
+        return {
+            "imported": True,
+            "deduplicated": False,
+            "stored_relative_path": relative_path,
+            "stored_filename": dest_path.name,
+        }
 
     def _parse_media_type(self, media_type_str: str) -> MediaType:
         """Parse media type string to enum."""
