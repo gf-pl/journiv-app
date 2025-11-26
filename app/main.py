@@ -282,9 +282,6 @@ log = logging.getLogger("uvicorn")
 WEB_BUILD_PATH = Path(__file__).resolve().parent.parent / "web"
 
 if WEB_BUILD_PATH.exists():
-    # Serve the Flutter web build directory
-    app.mount("/", StaticFiles(directory=str(WEB_BUILD_PATH), html=True), name="frontend")
-
     ONE_WEEK = int(timedelta(weeks=1).total_seconds())
 
     def serve_static_file(file_path: Path, cache: bool = True) -> FileResponse:
@@ -315,10 +312,20 @@ if WEB_BUILD_PATH.exists():
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def serve_spa(full_path: str, request: Request):
-        """Serve Flutter SPA index.html for all non-API routes."""
-        if full_path.startswith(("api/", "media/", "static/")):
+        """Serve Flutter Web SPA with proper fallback routing for path-based URLs."""
+        # Exclude API and media routes
+        if full_path.startswith(("api/", "media/")):
             raise HTTPException(status_code=404)
 
+        # Try to serve the requested file (for static assets like JS, CSS, images)
+        file_path = WEB_BUILD_PATH / full_path
+        if file_path.is_file():
+            # Static assets get long cache, except service worker
+            cache = not full_path.endswith(("service_worker.js", "flutter_service_worker.js"))
+            return serve_static_file(file_path, cache=cache)
+
+        # For all other routes (including /oidc-finish, /login, etc.), serve index.html
+        # This enables Flutter Web's path-based routing
         index_file = WEB_BUILD_PATH / "index.html"
         if index_file.exists():
             return serve_static_file(index_file, cache=False)

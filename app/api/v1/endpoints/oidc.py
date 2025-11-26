@@ -253,12 +253,13 @@ async def oidc_callback(
     # Redirect to SPA with ticket
     # Use DOMAIN_SCHEME and DOMAIN_NAME from settings instead of request.base_url
     # This ensures correct scheme (https) when running behind reverse proxy
+    # Uses path-based routing (no hash) to keep navigation in same browser tab
     if not settings.domain_name:
         # Fallback to request.base_url if domain_name not configured
         base_url = str(request.base_url).rstrip("/")
-        finish_url = f"{base_url}/#/oidc-finish?ticket={ticket}"
+        finish_url = f"{base_url}/oidc-finish?ticket={ticket}"
     else:
-        finish_url = f"{settings.domain_scheme}://{settings.domain_name}/#/oidc-finish?ticket={ticket}"
+        finish_url = f"{settings.domain_scheme}://{settings.domain_name}/oidc-finish?ticket={ticket}"
 
     log_info(f"OIDC login successful for {user.email}, redirecting to {finish_url}")
 
@@ -336,16 +337,21 @@ async def oidc_logout(request: Request):
         # Build post-logout redirect URI (where provider redirects back after logout)
         # Use DOMAIN_SCHEME and DOMAIN_NAME from settings instead of request.base_url
         # This ensures correct scheme (https) when running behind reverse proxy
+        # Uses path-based routing (no hash) to keep navigation in same browser tab
         if not settings.domain_name:
             # Fallback to request.base_url if domain_name not configured
             base_url = str(request.base_url).rstrip("/")
-            post_logout_redirect_uri = f"{base_url}/#/login?logout=success"
+            post_logout_redirect_uri = f"{base_url}/login?logout=success"
         else:
-            post_logout_redirect_uri = f"{settings.domain_scheme}://{settings.domain_name}/#/login?logout=success"
+            post_logout_redirect_uri = f"{settings.domain_scheme}://{settings.domain_name}/login?logout=success"
 
         if end_session_endpoint:
             # Properly encode query parameters for OIDC logout URL
-            logout_params = urlencode({"post_logout_redirect_uri": post_logout_redirect_uri})
+            # Include client_id for proper OIDC logout flow (required by some providers)
+            logout_params = urlencode({
+                "post_logout_redirect_uri": post_logout_redirect_uri,
+                "client_id": settings.oidc_client_id
+            })
             logout_url = f"{end_session_endpoint}?{logout_params}"
 
             log_info(f"Redirecting to OIDC provider logout: {logout_url}")
