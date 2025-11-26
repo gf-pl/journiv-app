@@ -215,6 +215,7 @@ class MoodService:
     def log_mood(self, user_id: uuid.UUID, mood_log_data: MoodLogCreate) -> MoodLog:
         """Log a mood for a user."""
         from app.services.user_service import UserService
+
         # Verify the mood exists
         mood = self.get_mood_by_id(mood_log_data.mood_id)
         if not mood:
@@ -232,6 +233,25 @@ class MoodService:
             logged_datetime_utc = self._as_utc(entry.entry_datetime_utc)
             logged_timezone = entry.entry_timezone
             logged_date = entry.entry_date
+
+            # Check if a mood_log already exists for this entry
+            existing_mood_logs = self.get_user_mood_logs(
+                user_id=user_id,
+                limit=1,
+                offset=0,
+                entry_id=mood_log_data.entry_id
+            )
+
+            if existing_mood_logs:
+                # Update existing mood_log instead of creating a new one
+                existing_mood_log = existing_mood_logs[0]
+                update_data = MoodLogUpdate(
+                    mood_id=mood_log_data.mood_id,
+                    note=mood_log_data.note,
+                    logged_datetime_utc=logged_datetime_utc,
+                    logged_timezone=logged_timezone
+                )
+                return self.update_mood_log(existing_mood_log.id, user_id, update_data)
         else:
             user_service = UserService(self.session)
             user_tz = user_service.get_user_timezone(user_id)
