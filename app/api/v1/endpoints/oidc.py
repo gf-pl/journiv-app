@@ -29,7 +29,7 @@ def register_oidc_provider():
             client_kwargs = {"scope": settings.oidc_scopes}
 
             # Disable SSL verification for local development with self-signed certificates
-            # SECURITY WARNING: Never disable SSL verification in production!
+            # Never disable SSL verification in production!
             if settings.oidc_disable_ssl_verify:
                 if settings.environment == "production":
                     raise ValueError(
@@ -174,7 +174,7 @@ async def oidc_callback(
     if not subject:
         log_error("OIDC claims missing 'sub' field")
         raise HTTPException(status_code=400, detail="Invalid OIDC claims: missing subject")
-        
+
     # Require email to be verified by the IDP before allowing account linking/login
     if email and not claims.get('email_verified', False):
         log_error(f"OIDC login failed: Email {email} not verified by identity provider.", subject=subject)
@@ -183,7 +183,8 @@ async def oidc_callback(
             detail="Email not verified by identity provider"
         )
         
-    # Normalize email to lowercase for reliable case-insensitive comparison
+    # Normalize email to lowercase immediately after security checks
+    # This ensures consistency for all subsequent database lookups (Issue #166 and #171 comment)
     if email:
         email = email.lower()
 
