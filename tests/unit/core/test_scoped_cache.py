@@ -116,3 +116,4 @@ class TestScopedCacheOperations:
         mock_cache.delete.assert_any_call("test_namespace:info:scope-123")
 
 
+
