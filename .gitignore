@@ -146,7 +146,6 @@ imports/
 
 # Test / fixture data
 test_data/
-fixtures/
 
 # ===============================================================
 # DOCS / BUILD / PROJECT FILES

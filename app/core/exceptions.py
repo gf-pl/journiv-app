@@ -57,6 +57,11 @@ class InvalidFileTypeError(JournivAppException):
     pass
 
 
+class InvalidMediaTypeError(JournivAppException):
+    """Raised when media type is invalid or unrecognized."""
+    pass
+
+
 class FileValidationError(JournivAppException):
     """Raised when file validation fails."""
     pass

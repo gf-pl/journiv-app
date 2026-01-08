@@ -87,4 +87,3 @@ class InstanceDetail(BaseModel, table=True):
         if v is not None and not re.match(r'^[0-9a-fA-F]{64}$', v):
             raise ValueError('plus_instance_secret must be 64 hexadecimal characters')
         return v
-

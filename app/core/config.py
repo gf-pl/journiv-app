@@ -122,6 +122,19 @@ class Settings(BaseSettings):
     ffprobe_timeout: int = 300  # 5 minutes for video metadata extraction
     ffmpeg_timeout: int = 300   # 5 minutes for video thumbnail generation
 
+    # Weather Configuration
+    weather_api_key: Optional[str] = None  # OpenWeather API key
+    weather_provider: str = "openweather"  # Weather provider (openweather)
+
+    @field_validator('weather_api_key', mode='before')
+    @classmethod
+    def trim_weather_api_key(cls, v):
+        """Trim whitespace from weather API key."""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return v.strip() if v.strip() else None
+        return v
 
     # Application configuration
     app_port: int = 8000
@@ -388,8 +401,8 @@ class Settings(BaseSettings):
         """Provide defaults for allowed_media_types if not set."""
         if v is None or not v:
             return [
-                "image/jpeg", "image/png", "image/gif", "image/webp",
-                "video/mp4", "video/avi", "video/mov", "video/webm",
+                "image/jpeg", "image/png", "image/gif", "image/webp", "image/heic",
+                "video/mp4", "video/avi", "video/mov", "video/webm", "video/x-m4v",
                 "audio/mpeg", "audio/wav", "audio/ogg", "audio/m4a", "audio/aac"
             ]
         return v
@@ -436,8 +449,8 @@ class Settings(BaseSettings):
         """Provide defaults for allowed_file_extensions if not set."""
         if v is None or not v:
             return [
-                ".jpg", ".jpeg", ".png", ".gif", ".webp",
-                ".mp4", ".avi", ".mov", ".webm",
+                ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic",
+                ".mp4", ".avi", ".mov", ".webm", ".m4v",
                 ".mp3", ".wav", ".ogg", ".m4a", ".aac"
             ]
         return v

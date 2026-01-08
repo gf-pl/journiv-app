@@ -261,3 +261,40 @@ def validate_timezone(tz_name: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def normalize_timezone(tz_name: Optional[str]) -> str:
+    """
+    Normalize and validate a timezone string, with fallback to UTC.
+
+    Handles None values, strips whitespace, validates against IANA timezone
+    database, and falls back to UTC if invalid.
+
+    Args:
+        tz_name: IANA timezone string to normalize (can be None)
+
+    Returns:
+        str: Validated IANA timezone string, or "UTC" if invalid/None
+
+    Example:
+        >>> normalize_timezone("America/Los_Angeles")
+        "America/Los_Angeles"
+        >>> normalize_timezone("  America/New_York  ")
+        "America/New_York"
+        >>> normalize_timezone("Invalid/Timezone")
+        "UTC"
+        >>> normalize_timezone(None)
+        "UTC"
+        >>> normalize_timezone("")
+        "UTC"
+    """
+    from app.core.logging_config import log_warning
+
+    normalized = (tz_name or "UTC").strip() or "UTC"
+    try:
+        ZoneInfo(normalized)
+        return normalized
+    except Exception:
+        if tz_name:  # Only log warning if user actually provided a value
+            log_warning(f"Invalid timezone '{normalized}', defaulting to UTC", timezone=normalized)
+        return "UTC"

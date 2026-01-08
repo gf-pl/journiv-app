@@ -5,6 +5,7 @@ import logging
 import logging.handlers
 from enum import Enum
 from pathlib import Path
+from typing import Optional
 
 
 class LogCategory(str, Enum):
@@ -48,6 +49,37 @@ SENSITIVE_FIELDS = {
     'oidc_client_secret',
     'oidcclientsecret',
 }
+
+
+def redact_coordinates(latitude: Optional[float] = None, longitude: Optional[float] = None) -> Optional[dict]:
+    """
+    Redact precise coordinates by rounding to coarse geo-bin.
+
+    Rounds coordinates to 1 decimal place (~11km precision) to provide
+    general location without precise coordinates.
+
+    Args:
+        latitude: Latitude coordinate (must be in range -90 to 90)
+        longitude: Longitude coordinate (must be in range -180 to 180)
+
+    Returns:
+        Dictionary with redacted coordinates (or None if not provided or invalid)
+    """
+    result = {}
+
+    if latitude is not None:
+        if -90 <= latitude <= 90:
+            result['latitude_approx'] = round(latitude, 1)
+        else:
+            log_warning(f"Invalid latitude value {latitude} (must be between -90 and 90), omitting from log")
+
+    if longitude is not None:
+        if -180 <= longitude <= 180:
+            result['longitude_approx'] = round(longitude, 1)
+        else:
+            log_warning(f"Invalid longitude value {longitude} (must be between -180 and 180), omitting from log")
+
+    return result if result else None
 
 
 def _sanitize_data(data):
@@ -210,7 +242,7 @@ def get_request_logger():
     return RequestContextLogger(LogCategory.REQUEST)
 
 
-def _log_with_context(logger: logging.Logger, level: int, message: str, request_id: str = None, exc_info: bool = False, **kwargs):
+def _log_with_context(logger: logging.Logger, level: int, message: str, request_id: Optional[str] = None, exc_info: bool = False, **kwargs):
     """Internal helper to format logs with an optional request ID and extra context.
 
     Args:
@@ -271,13 +303,13 @@ def log_debug(message: str, request_id: str = None, **kwargs):
     _log_with_context(logger, logging.DEBUG, message, request_id, **kwargs)
 
 
-def log_warning(message: str, request_id: str = None, **kwargs):
+def log_warning(message: str, request_id: Optional[str] = None, **kwargs):
     """Log warning messages with request ID."""
     logger = logging.getLogger(LogCategory.APP)
     _log_with_context(logger, logging.WARNING, message, request_id, **kwargs)
 
 
-def log_error(error: Exception | str, request_id: str = None, user_email: str = None, **kwargs):
+def log_error(error: Exception | str, request_id: Optional[str] = None, user_email: Optional[str] = None, **kwargs):
     """Log errors with request ID.
 
     Args:
